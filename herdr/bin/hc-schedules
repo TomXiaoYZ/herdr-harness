@@ -1,0 +1,272 @@
+#!/opt/homebrew/bin/python3 -I
+"""Scheduled tasks on this machine, as JSON for the sidebar's "Scheduled" tab. Read-only.
+
+  hc-schedules        [{source, id, name, state: on|off, when, next, last, expires, problem, cwd}, …]
+
+Sources, each read from what the owning tool already keeps:
+  session       jobs a running Claude Code session scheduled inside itself (CronCreate, e.g. via /loop): read from
+                the transcripts of the sessions that are alive (~/.claude/sessions/<pid>.json). A job counts while
+                its session has a live process and it was not deleted (a resumed session picks its jobs up
+                again); recurring ones expire 7 days after they were made (`expires`). A session open in two
+                processes at once is flagged: the job may fire in each
+  claude-desktop scheduled-tasks.json of the signed-in account (~/Library/Application Support/Claude); the
+                prompt of each task lives in ~/.claude/scheduled-tasks/<id>/SKILL.md
+  Codex         ~/.codex/automations/*/automation.toml
+  herdr         ~/.agents/scheduled-tasks/*/ (hc-task): Claude Code tasks fired by launchd, one long-lived session each;
+                `result` is the latest run's text, `open` the command that shows its session. Their launchd jobs
+                (local.hc-task.*) are listed here, not again under launchd
+  launchd       ~/Library/LaunchAgents/*.plist that have a schedule (StartInterval / StartCalendarInterval)
+                and are not an application's own helper; long-running KeepAlive services are not tasks
+`state` is on when the task will fire by itself; paused tasks are listed as off. One-shot tasks that already
+fired are left out. `next` / `last` are epoch seconds or null. `problem` is a short reason when an enabled
+task did not run at its last slot or its last run exited non-zero. Running tasks on, off or now is not done here.
+"""
+import fcntl
+import glob
+import json
+import os
+import plistlib
+import subprocess
+import time
+import tomllib
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser('~')
+SESSION_JOB_DAYS = 7  # 会话内的循环任务建好后这么多天自动失效（Claude Code 的规矩）
+GRACE = 20 * 60  # 过了计划时间这么久还没有运行记录，才算“没跑”
+FREQ = {'MINUTELY': 'min', 'HOURLY': 'h', 'DAILY': 'd', 'WEEKLY': 'wk'}
+
+
+def field(text, low, high):
+    """One cron field → set of ints; raises ValueError on anything it does not understand."""
+    out = set()
+    for part in text.split(','):
+        span, _, step = part.partition('/')
+        a, _, b = span.partition('-')
+        first, last = (low, high) if a == '*' else (int(a), int(b) if b else (high if step else int(a)))
+        if not (low <= first <= last <= high):
+            raise ValueError(text)
+        out.update(range(first, last + 1, int(step) if step else 1))
+    return out
+
+
+def parse(expr):
+    """Five-field cron (local time) → matcher, or None when it cannot be read."""
+    try:
+        m, h, dom, mon, dow = expr.split()
+        return {'m': sorted(field(m, 0, 59)), 'h': sorted(field(h, 0, 23)), 'dom': field(dom, 1, 31), 'mon': field(mon, 1, 12),
+                'dow': {d % 7 for d in field(dow, 0, 7)}, 'any_dom': dom == '*', 'any_dow': dow == '*'}
+    except ValueError:
+        return None
+
+
+def day_ok(c, d):
+    if d.month not in c['mon']:
+        return False
+    dom, dow = d.day in c['dom'], (d.weekday() + 1) % 7 in c['dow']
+    if c['any_dom'] or c['any_dow']:
+        return dom and dow
+    return dom or dow  # 日和星期都写了：满足一个就跑（cron 的规矩）
+
+
+def slot(crons, now, forward):
+    """Nearest scheduled time after (forward) or at/before `now`, as epoch seconds; looks one year ahead, 8 days back."""
+    at, best = datetime.fromtimestamp(now), None
+    for c in filter(None, map(parse, crons)):
+        for off in range(367 if forward else 9):
+            day = at.date() + timedelta(days=off if forward else -off)
+            if not day_ok(c, day):
+                continue
+            times = [datetime(day.year, day.month, day.day, h, m) for h in c['h'] for m in c['m']]
+            hit = next((t for t in times if t > at), None) if forward else next((t for t in reversed(times) if t <= at), None)
+            if hit:
+                best = hit if best is None or (hit < best if forward else hit > best) else best
+                break
+    return int(best.timestamp()) if best else None
+
+
+def stamp(text):
+    """ISO UTC time → epoch seconds."""
+    try:
+        return int(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+    except Exception:
+        return None
+
+
+def head(prompt):
+    """A job's name: the opening words of its prompt."""
+    cut = min((i for i in (prompt.find(c) for c in '：:，,。（(\n') if i > 0), default=len(prompt))
+    return prompt[:min(cut, 24)].strip() or 'session job'
+
+
+def sessions(now):
+    out, alive = [], {}
+    for path in glob.glob(f'{HOME}/.claude/sessions/*.json'):
+        try:
+            s = json.load(open(path))
+            os.kill(int(s['pid']), 0)  # 进程不在了：它排的任务也没了
+            alive.setdefault(s['sessionId'], []).append(s)
+        except Exception:
+            continue
+    for sid, procs in alive.items():
+        s = procs[0]
+        try:
+            log = glob.glob(f'{HOME}/.claude/projects/*/{sid}.jsonl')[0]
+        except IndexError:
+            continue
+        asked, jobs = {}, {}
+        for line in open(log, errors='replace'):
+            if '"CronCreate"' not in line and '"CronDelete"' not in line and '"humanSchedule"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            made, parts = d.get('toolUseResult'), (d.get('message') or {}).get('content')
+            for b in parts if isinstance(parts, list) else []:
+                if b.get('type') == 'tool_use' and b.get('name') == 'CronCreate':
+                    asked[b.get('id')] = b.get('input') or {}
+                elif b.get('type') == 'tool_use' and b.get('name') == 'CronDelete':
+                    jobs.pop((b.get('input') or {}).get('id'), None)
+                elif b.get('type') == 'tool_result' and b.get('tool_use_id') in asked and isinstance(made, dict) and made.get('id'):
+                    jobs[made['id']] = {**asked[b['tool_use_id']], 'created': stamp(d.get('timestamp') or ''), 'fire': (made.get('nextFireAt') or 0) / 1000}
+        for jid, j in jobs.items():
+            cron, loop, created = str(j.get('cron') or ''), j.get('recurring', True), j.get('created') or 0
+            expires = created + SESSION_JOB_DAYS * 86400 if loop else None
+            if (expires and expires < now) or (not loop and j['fire'] < now):
+                continue  # 已到期的、已经跑过的一次性任务
+            out.append({'source': 'session', 'id': f"{sid[:8]}-{jid}", 'name': head(str(j.get('prompt') or '')), 'state': 'on',
+                        'when': cron if loop else 'once', 'next': slot([cron], now, True) if loop else int(j['fire']), 'last': None,
+                        'expires': expires, 'cwd': s.get('cwd'),
+                        'problem': f'this session is open in {len(procs)} processes, the job may run twice' if len(procs) > 1 else None})
+    return out
+
+
+def claude(now):
+    root = f'{HOME}/Library/Application Support/Claude'
+    files = glob.glob(f'{root}/claude-code-sessions/*/*/scheduled-tasks.json') + glob.glob(f'{root}/local-agent-mode-sessions/*/*/scheduled-tasks.json')
+    try:  # 只看当前登录的账户；换过账户后旧账户的任务不会再跑
+        account = json.load(open(f'{root}/config.json')).get('lastKnownAccountUuid')
+        files = [f for f in files if f.split('/')[-3] == account] or files
+    except Exception:
+        pass
+    seen = {}
+    for path in sorted(files, key=os.path.getmtime):
+        try:
+            tasks = json.load(open(path)).get('scheduledTasks') or []
+        except Exception:
+            continue
+        for k in tasks:
+            cron, fire, on = k.get('cronExpression'), (k.get('fireAt') or 0) / 1000, bool(k.get('enabled'))
+            if not cron and not (on and fire > now):
+                continue  # 一次性的任务，已经跑过或已关掉
+            last = stamp(k.get('lastRunAt') or '')
+            item = {'source': 'claude-desktop', 'id': k.get('id'), 'name': k.get('displayName') or k.get('id'), 'state': 'on' if on else 'off',
+                    'when': cron or 'once', 'next': (slot([cron], now, True) if cron else int(fire)) if on else None,
+                    'last': last, 'problem': None, 'cwd': k.get('cwd')}
+            due = slot([cron], now, False) if on and cron else None
+            if due and due > (k.get('createdAt') or 0) / 1000 and now - due > GRACE and (last or 0) < due:
+                item['problem'] = 'missed its last slot (Claude Desktop not running, or skipped)'
+            seen[item['id']] = item
+    return list(seen.values())
+
+
+def codex(now):
+    out = []
+    for path in glob.glob(f'{HOME}/.codex/automations/*/automation.toml'):
+        try:
+            d = tomllib.load(open(path, 'rb'))
+        except Exception:
+            continue
+        rule = dict(p.split('=', 1) for p in str(d.get('rrule', '')).split(';') if '=' in p)
+        when = f"every {rule.get('INTERVAL', '1')} {FREQ[rule['FREQ']]}" if set(rule) <= {'FREQ', 'INTERVAL'} and rule.get('FREQ') in FREQ else d.get('rrule') or ''
+        out.append({'source': 'codex', 'id': d.get('id') or os.path.basename(os.path.dirname(path)), 'name': d.get('name') or d.get('id'),
+                    'state': 'on' if d.get('status') == 'ACTIVE' else 'off', 'when': when, 'next': None, 'last': None, 'problem': None,
+                    'cwd': (d.get('cwds') or [None])[0]})
+    return out
+
+
+HC_TASK_PROBLEM = {'error': 'last run failed', 'blocked': 'last run is waiting for you', 'timeout': 'last run timed out'}
+
+
+def locked(path):
+    """True while another process holds the lock file (an hc-task run in progress)."""
+    try:
+        with open(path, 'a') as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
+def herdr(now):
+    out = []
+    for path in glob.glob(f'{HOME}/.agents/scheduled-tasks/*/task.json'):
+        try:
+            t = json.load(open(path))
+        except Exception:
+            continue
+        try:
+            r = json.load(open(os.path.join(os.path.dirname(path), 'runs', 'latest.json')))
+        except Exception:
+            r = {}
+        on, cron, last = bool(t.get('enabled')), t.get('cron') or '', stamp(r.get('started') or '')
+        problem = HC_TASK_PROBLEM.get(r.get('status'))
+        due = slot([cron], now, False) if on else None
+        if on and due and now - due > GRACE and (last or 0) < due - 60 and due > os.path.getmtime(path):
+            problem = 'missed its last slot (Mac asleep or launchd did not fire)'
+        out.append({'source': 'herdr', 'id': t.get('id'), 'name': t.get('name') or t.get('id'), 'state': 'on' if on else 'off',
+                    'when': cron, 'next': slot([cron], now, True) if on else None, 'last': last, 'problem': problem if on else None,
+                    'cwd': t.get('cwd'), 'result': r.get('result'), 'status': r.get('status'), 'open': ['hc-task', 'open', t.get('id')],
+                    'running': locked(os.path.join(os.path.dirname(path), 'runs', '.lock'))})
+    return out
+
+
+def launchd(now):
+    plists = []
+    for path in glob.glob(f'{HOME}/Library/LaunchAgents/*.plist'):
+        try:
+            d = plistlib.load(open(path, 'rb'))
+        except Exception:
+            continue
+        args = [str(a) for a in d.get('ProgramArguments') or [d.get('Program') or '']]
+        own = args[0] and not args[0].startswith(('/Applications/', '/Library/', '/System/')) and '.app/Contents/' not in args[0]
+        if d.get('Label') and own and not d['Label'].startswith('local.hc-task.') and (d.get('StartInterval') or d.get('StartCalendarInterval')):
+            plists.append(d)
+    if not plists:
+        return []
+    loaded, disabled = {}, set()
+    try:
+        for line in subprocess.run(['launchctl', 'list'], capture_output=True, text=True, timeout=10).stdout.splitlines()[1:]:
+            _pid, code, label = line.split('\t')
+            loaded[label] = int(code) if code.lstrip('-').isdigit() else 0
+        for line in subprocess.run(['launchctl', 'print-disabled', f'gui/{os.getuid()}'], capture_output=True, text=True, timeout=10).stdout.splitlines():
+            if '=>' in line and line.split('=>')[1].strip() in ('disabled', 'true'):
+                disabled.add(line.split('=>')[0].strip().strip('"'))
+    except Exception:
+        pass
+    out = []
+    for d in plists:
+        label, cal = d['Label'], d.get('StartCalendarInterval')
+        cal = [cal] if isinstance(cal, dict) else cal or []
+        crons = [' '.join(str(c.get(k, '*')) for k in ('Minute', 'Hour', 'Day', 'Month', 'Weekday')) for c in cal]
+        every = d.get('StartInterval')
+        when = (f'every {every // 60} min' if every and every >= 60 else f'every {every} s') if every else crons[0] + (f' +{len(crons) - 1} more' if len(crons) > 1 else '')
+        on = label in loaded and label not in disabled
+        code = loaded.get(label, 0)
+        out.append({'source': 'launchd', 'id': label, 'name': label, 'state': 'on' if on else 'off', 'when': when,
+                    'next': slot(crons, now, True) if on and crons else None, 'last': None,
+                    'problem': f'last run exited with code {code}' if on and code else None, 'cwd': d.get('WorkingDirectory')})
+    return out
+
+
+def collect(now=None):
+    now = now or time.time()
+    tasks = sessions(now) + herdr(now) + claude(now) + codex(now) + launchd(now)
+    return sorted(tasks, key=lambda k: (k['state'] != 'on', k['next'] is None, k['next'] or 0, k['name'] or ''))
+
+
+if __name__ == '__main__':
+    print(json.dumps(collect(), ensure_ascii=False))

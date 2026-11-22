@@ -1,0 +1,13 @@
+#!/bin/bash
+# Start pi as a light helper inside a herdr-core terminal, on DeepSeek.
+# The API key is read from the login Keychain (service "deepseek-api") at start and only
+# exported to this process. Project-local .pi files are ignored (--no-approve).
+# Chrome tools come from ~/.pi/agent/mcp.json (Claude Code's browser bridge, registered by herdr/install.sh).
+set -euo pipefail
+key=$(security find-generic-password -s deepseek-api -w 2>/dev/null) || {
+  echo "deepseek-api is not in the Keychain: first run security add-generic-password -s deepseek-api -a \"\$USER\" -w" >&2
+  exit 1
+}
+export DEEPSEEK_API_KEY="$key"
+unset key
+exec "$HOME/.local/bin/pi" --no-approve --model "${HC_PI_MODEL:-deepseek/deepseek-flash}" "$@"

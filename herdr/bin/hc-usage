@@ -1,0 +1,157 @@
+#!/opt/homebrew/bin/python3 -I
+"""Usage and remaining quota of the agents Herdr runs, as JSON for the sidebar.
+
+  hc-usage            [{agent, quota: [{name, used, resets}], balance, today: {tokens, cost}}, …]
+
+Everything is read from what the tools already keep on this machine, plus one balance call:
+  Claude Code   limits from ~/.herdr/usage/claude.json (written by hc-cc-statusline); today's tokens from transcripts
+  Codex         limits and tokens from today's rollout logs (~/.codex/sessions)
+  DeepSeek      (opencode and pi) balance from the provider with the Keychain key; today's cost from pi's
+                session logs and `opencode stats`
+Tokens are fresh input + output (cache reads left out). A source that cannot be read is simply missing from
+the output; the key is never printed.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.request
+
+HOME = os.path.expanduser('~')
+DAY = time.strftime('%Y-%m-%d')
+MIDNIGHT = time.mktime(time.strptime(DAY, '%Y-%m-%d'))
+
+
+def today(pattern):
+    return [p for p in glob.glob(pattern, recursive=True) if os.path.getmtime(p) >= MIDNIGHT]
+
+
+def local_day(stamp):
+    """ISO UTC timestamp → is it today, local time."""
+    try:
+        return time.mktime(time.strptime(stamp[:19], '%Y-%m-%dT%H:%M:%S')) - time.timezone + (3600 if time.localtime().tm_isdst else 0) >= MIDNIGHT
+    except Exception:
+        return False
+
+
+def window(key):
+    """five_hour -> 5h，seven_day -> 周，seven_day_<model> -> <Model> 周；不认识的键原样显示。"""
+    if key == 'five_hour':
+        return '5h'
+    if key == 'seven_day':
+        return 'week'
+    if key.startswith('seven_day_'):
+        return key[len('seven_day_'):].replace('_', ' ').title() + ' week'
+    return key
+
+
+def claude():
+    out = {'agent': 'Claude Code', 'quota': []}
+    try:
+        got = json.load(open(f'{HOME}/.herdr/usage/claude.json'))
+        for key, w in got['rate_limits'].items():  # 有什么窗口列什么：5 小时、每周、按模型的每周（如 Fable）
+            if isinstance(w, dict) and w.get('used_percentage') is not None and (w.get('resets_at') or 0) > time.time():
+                out['quota'].append({'name': window(key), 'used': round(w['used_percentage']), 'resets': w.get('resets_at')})
+    except Exception:
+        pass
+    seen = {}
+    for path in today(f'{HOME}/.claude/projects/**/*.jsonl'):
+        try:
+            for line in open(path, errors='replace'):
+                if '"usage"' not in line:
+                    continue
+                d = json.loads(line)
+                m = d.get('message') or {}
+                u = m.get('usage')
+                if u and local_day(d.get('timestamp', '')):
+                    seen[m.get('id') or line[:80]] = (u.get('input_tokens') or 0) + (u.get('cache_creation_input_tokens') or 0) + (u.get('output_tokens') or 0)
+        except Exception:
+            continue
+    out['today'] = {'tokens': sum(seen.values())}
+    return out
+
+
+def codex():
+    out = {'agent': 'Codex', 'quota': []}
+    files = sorted(today(f'{HOME}/.codex/sessions/**/rollout-*.jsonl'), key=os.path.getmtime)
+    tokens, limits = 0, None
+    for path in files:
+        first = last = None
+        try:
+            for line in open(path, errors='replace'):
+                if '"token_count"' not in line:
+                    continue
+                d = json.loads(line)
+                info = (d.get('payload') or {}).get('info') or {}
+                total = info.get('total_token_usage')
+                if total:
+                    spent = total.get('input_tokens', 0) - total.get('cached_input_tokens', 0) + total.get('output_tokens', 0)
+                    if not local_day(d.get('timestamp', '')):
+                        first = spent  # 昨天开的会话：只算今天新增的
+                    last = spent
+                limits = (d.get('payload') or {}).get('rate_limits') or limits
+        except Exception:
+            continue
+        if last is not None:
+            tokens += last - (first or 0)
+    if not limits:  # 今天还没用过 Codex：取最近一次会话记下的额度，窗口已重置的不显示
+        for path in sorted(glob.glob(f'{HOME}/.codex/sessions/**/rollout-*.jsonl', recursive=True), key=os.path.getmtime, reverse=True)[:20]:
+            try:
+                for line in open(path, errors='replace'):
+                    if '"rate_limits"' in line:
+                        limits = (json.loads(line).get('payload') or {}).get('rate_limits') or limits
+            except Exception:
+                continue
+            if limits:
+                break
+    for name, key in (('primary', 'primary'), ('secondary', 'secondary')):
+        w = (limits or {}).get(key)
+        if isinstance(w, dict) and w.get('used_percent') is not None and (w.get('resets_at') or time.time() + 1) > time.time():
+            mins = w.get('window_minutes') or 0
+            out['quota'].append({'name': 'week' if mins == 10080 else '5h' if mins == 300 else name,
+                                 'used': round(w['used_percent']), 'resets': w.get('resets_at')})
+    out['today'] = {'tokens': tokens}
+    return out
+
+
+def deepseek():
+    out = {'agent': 'DeepSeek', 'note': 'opencode · pi', 'quota': []}
+    try:
+        key = subprocess.run(['security', 'find-generic-password', '-s', 'deepseek-api', '-w'], capture_output=True, text=True, timeout=10).stdout.strip()
+        if key:
+            req = urllib.request.Request('https://api.deepseek.com/user/balance', headers={'Authorization': f'Bearer {key}'})
+            info = json.load(urllib.request.urlopen(req, timeout=10))['balance_infos'][0]
+            out['balance'] = {'amount': float(info['total_balance']), 'currency': info['currency']}
+    except Exception:
+        pass
+    cost = tokens = 0
+    for path in today(f'{HOME}/.pi/agent/sessions/**/*.jsonl'):
+        try:
+            for line in open(path, errors='replace'):
+                if '"usage"' not in line:
+                    continue
+                d = json.loads(line)
+                u = (d.get('message') or {}).get('usage')
+                if u and local_day(d.get('timestamp', '')):
+                    cost += (u.get('cost') or {}).get('total') or 0
+                    tokens += (u.get('input') or 0) + (u.get('output') or 0)
+        except Exception:
+            continue
+    try:
+        said = subprocess.run(['/opt/homebrew/bin/opencode', 'stats', '--days', '0', '--cost'], capture_output=True, text=True, timeout=30).stdout
+        unit = {'k': 1e3, 'm': 1e6, 'b': 1e9}
+        for word, kind in (('cost', 'cost'), ('input', 'tokens'), ('output', 'tokens')):
+            m = re.search(rf'^\s*{word}\s+\$?([\d.]+)([kmb]?)\s*$', said, re.M | re.I)
+            if m:
+                n = float(m.group(1)) * unit.get(m.group(2).lower(), 1)
+                cost, tokens = (cost + n, tokens) if kind == 'cost' else (cost, tokens + n)
+    except Exception:
+        pass
+    out['today'] = {'tokens': round(tokens), 'cost': round(cost, 4), 'currency': 'USD'}
+    return out
+
+
+if __name__ == '__main__':
+    print(json.dumps([claude(), codex(), deepseek()], ensure_ascii=False))

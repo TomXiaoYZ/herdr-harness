@@ -1,0 +1,7 @@
+{
+  "projects": [
+    { "name": "Agent Harness", "folders": ["~/Code/herdr-harness"] },
+    { "name": "Web App", "folders": ["~/Code/web-app", "~/Code/web-app-infra"], "main": "~/Code/web-app" },
+    { "name": "Side Project", "folders": ["~/Code/side-project"] }
+  ]
+}

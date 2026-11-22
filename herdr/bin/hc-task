@@ -1,0 +1,645 @@
+#!/opt/homebrew/bin/python3 -I
+"""Scheduled Claude Code tasks owned by herdr: launchd fires them, each task keeps one long-lived session.
+
+  hc-task ls                       tasks with their last result, as JSON (for hc-schedules and the sidebar)
+  hc-task results                  latest result of every task, as text (also kept in RESULTS.md)
+  hc-task run <id>                 one run now: what launchd calls at each slot
+  hc-task open <id>                show the task's session in herdr (starts it when it is not running)
+  hc-task open                     show the Results tab: the latest result of every task
+  hc-task on|off <id>              enable or pause a task: writes or removes its launchd job
+  hc-task show <id>                the task and its prompt, as JSON (for the editor)
+  hc-task save [--json '{...}'] < task.json  create or update a task from JSON {id?, name, cron, cwd, prompt, permission_mode,
+                                   model, chrome, enabled}; no id = new task. Prints {"id": ...}
+  hc-task next '<cron>'            the next run times of a cron, as JSON {next: [...]} or {error}
+  hc-task run <id> --detach        start one run in the background and return at once (the editor's Run now)
+  hc-task sync                     make launchd match the task list (after editing a task.json by hand)
+  hc-task import-desktop [--apply] copy Claude Desktop's scheduled tasks here (plan only without --apply);
+                                   enabled stays as it was, so paused tasks stay paused
+  hc-task rm <id>                  remove a task: its launchd job goes, its folder moves to the Trash
+
+Each task is a folder ~/.agents/scheduled-tasks/<id>/:
+  task.json   {id, name, cron (five fields, local time), cwd, permission_mode, model, chrome, enabled, session}
+  prompt.md   what one run does
+  runs/       one JSON per run {started, finished, status, result}; the newest KEEP_RUNS are kept, older ones are
+              deleted at the end of each run. latest.json is the newest. launchd.log holds launchd's own output.
+RESULTS.md beside the task folders is rewritten after every run: the latest result of each task in one place.
+
+A run types the prompt into the task's terminal `sched-<id>`: an interactive `claude` on the task's fixed session
+id, in the herdr space "Scheduled" (one tab per task). When the terminal is not running it is started first, resuming
+that session, so the conversation carries over from run to run and you can read or continue it any time. The run
+waits for the turn to end, then copies the last assistant message from the transcript into runs/. A turn that
+stops on a question counts as `blocked`. Only one run per task at a time; a slot that finds a run still going is
+recorded as `skipped`.
+"""
+import fcntl
+import glob
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime
+
+HOME = os.path.expanduser('~')
+ROOT = os.environ.get('HC_TASK_HOME', f'{HOME}/.agents/scheduled-tasks')
+AGENTS = os.environ.get('HC_TASK_LAUNCHAGENTS', f'{HOME}/Library/LaunchAgents')
+HC = f'{HOME}/.local/bin/hc'
+HERDR_APP = f'{HOME}/.local/bin/herdr-app'
+CLAUDE = f'{HOME}/.local/bin/claude'
+SELF = os.environ.get('HC_TASK_SELF', f'{HOME}/.local/bin/hc-task')
+SPACE = 'Scheduled'
+OLD_SPACE = '定时任务'  # renamed to SPACE the first time it is seen
+RESULTS_TAB = 'Results'
+LABEL = 'local.hc-task.'
+KEEP_RUNS = 60
+TURN_LIMIT = 90 * 60  # 一次运行最多等这么久
+BUSY_LIMIT = 30 * 60  # 终端正忙（比如你在里面聊）时，最多等这么久再发
+PATH = f'{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
+CHROME_HINT = re.compile(r'chrome|浏览器|browser', re.I)
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec='seconds')
+
+
+def tasks():
+    out = []
+    for path in sorted(glob.glob(f'{ROOT}/*/task.json')):
+        try:
+            out.append(json.load(open(path)))
+        except Exception:
+            continue
+    return out
+
+
+def task(tid):
+    try:
+        return json.load(open(f'{ROOT}/{tid}/task.json'))
+    except FileNotFoundError:
+        die(f'no such task: {tid} (hc-task ls lists them)')
+
+
+def save(t):
+    path = f'{ROOT}/{t["id"]}/task.json'
+    with open(path + '.tmp', 'w') as f:
+        json.dump(t, f, ensure_ascii=False, indent=2)
+    os.replace(path + '.tmp', path)
+
+
+def latest(tid):
+    try:
+        return json.load(open(f'{ROOT}/{tid}/runs/latest.json'))
+    except Exception:
+        return None
+
+
+# ---------- cron → launchd ----------
+
+def field(text, low, high):
+    out = set()
+    for part in text.split(','):
+        span, _, step = part.partition('/')
+        a, _, b = span.partition('-')
+        first, last = (low, high) if a == '*' else (int(a), int(b) if b else (high if step else int(a)))
+        if not (low <= first <= last <= high):
+            raise ValueError(text)
+        out.update(range(first, last + 1, int(step) if step else 1))
+    return sorted(out)
+
+
+def calendar(cron):
+    """Five-field cron → StartCalendarInterval entries. Day-of-month and month must be * (all current tasks are)."""
+    m, h, dom, mon, dow = cron.split()
+    if dom != '*' or mon != '*':
+        raise ValueError(f'only crons with * for day of month and month are supported: {cron}')
+    days = [None] if dow == '*' else sorted({d % 7 for d in field(dow, 0, 7)})
+    return [{k: v for k, v in (('Minute', mi), ('Hour', hr), ('Weekday', d)) if v is not None}
+            for d in days for hr in field(h, 0, 23) for mi in field(m, 0, 59)]
+
+
+def plist_path(tid):
+    return f'{AGENTS}/{LABEL}{tid}.plist'
+
+
+def launchctl(*args):
+    return subprocess.run(['launchctl', *args], capture_output=True, text=True)
+
+
+def sync_one(t):
+    path, label, domain = plist_path(t['id']), LABEL + t['id'], f'gui/{os.getuid()}'
+    launchctl('bootout', f'{domain}/{label}')
+    if not t.get('enabled'):
+        if os.path.exists(path):
+            os.remove(path)
+        return 'off'
+    data = {
+        'Label': label,
+        'ProgramArguments': [SELF, 'run', t['id']],
+        'EnvironmentVariables': {'PATH': PATH, 'HOME': HOME, 'HC_TASK_HOME': ROOT},
+        'StartCalendarInterval': calendar(t['cron']),
+        'StandardOutPath': f'{ROOT}/{t["id"]}/runs/launchd.log',
+        'StandardErrorPath': f'{ROOT}/{t["id"]}/runs/launchd.log',
+        'RunAtLoad': False,
+    }
+    os.makedirs(AGENTS, exist_ok=True)
+    os.makedirs(f'{ROOT}/{t["id"]}/runs', exist_ok=True)
+    with open(path, 'wb') as f:
+        plistlib.dump(data, f)
+    r = launchctl('bootstrap', domain, path)
+    if r.returncode:
+        die(f'launchctl bootstrap {label} failed: {r.stderr.strip()}', 1)
+    return 'on'
+
+
+# ---------- herdr terminal ----------
+
+def hc(*args, check=False):
+    r = subprocess.run([HC, *args], capture_output=True, text=True)
+    if check and r.returncode:
+        die(f'hc {" ".join(args[:2])} failed: {(r.stderr or r.stdout).strip()[:300]}', 1)
+    return r
+
+
+def terminal(t):
+    """The live terminal of the task, or None."""
+    r = hc('get', f'sched-{t["id"]}', '--json')
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return d if d.get('state') == 'live' else None
+
+
+def retire(tid):
+    """End the task's session terminal and remove it, so its tab goes and the next run starts a fresh one
+    (same conversation via --resume). The transcript stays in ~/.claude."""
+    name = f'sched-{tid}'
+    hc('kill', name)
+    for _ in range(20):
+        try:
+            if json.loads(hc('get', name, '--json').stdout).get('state') != 'live':
+                break
+        except ValueError:
+            return
+        time.sleep(0.25)
+    hc('rm', name)
+
+
+def state(d):
+    """idle / working / blocked / done from `hc get`; status is {app, state} when the agent reports it."""
+    st = (d or {}).get('status')
+    return st.get('state') if isinstance(st, dict) else st
+
+
+def space_id():
+    """Id of the herdr window space for scheduled tasks, made when the window is open and it does not exist yet."""
+    def look():
+        try:
+            spaces = json.loads(subprocess.run([HERDR_APP, 'ls'], capture_output=True, text=True, timeout=20).stdout)['spaces']
+        except Exception:
+            return None
+        for s in spaces:  # the space used to be called 定时任务: rename it (and its Results tab) in place
+            if s.get('name') == OLD_SPACE:
+                subprocess.run([HERDR_APP, 'do', 'space.rename', json.dumps({'id': s['id'], 'name': SPACE})], capture_output=True, timeout=20)
+                for tab in s.get('tabs') or []:
+                    if tab.get('name') == '汇总':
+                        subprocess.run([HERDR_APP, 'do', 'tab.rename', json.dumps({'id': tab['id'], 'name': RESULTS_TAB})], capture_output=True, timeout=20)
+                return s['id']
+        return next((s['id'] for s in spaces if s.get('name') == SPACE), None)
+    sid = look()
+    if not sid:
+        req = {'name': SPACE, 'folder': ROOT, 'tab': RESULTS_TAB, 'argv': [SELF, 'results', '--watch'], 'focus': False}
+        subprocess.run([HERDR_APP, 'do', 'space.new', json.dumps(req, ensure_ascii=False)], capture_output=True, text=True, timeout=20)
+        sid = look()
+    cache = f'{ROOT}/.space'
+    if sid:
+        open(cache, 'w').write(sid)
+        return sid
+    try:  # 窗口没开：用上次记下的空间，窗口再开时终端就在里面
+        return open(cache).read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def tab_of(address):
+    """Window tab id that holds the terminal (herdr does not label it), or None when the window is closed."""
+    try:
+        spaces = json.loads(subprocess.run([HERDR_APP, 'ls'], capture_output=True, text=True, timeout=20).stdout)['spaces']
+    except Exception:
+        return None
+    return next((tab['id'] for s in spaces for tab in s.get('tabs') or []
+                 if any(x.get('terminal') == address for x in tab.get('terminals') or [])), None)
+
+
+def transcript(t):
+    hits = glob.glob(f'{HOME}/.claude/projects/*/{t["session"]}.jsonl')
+    return hits[0] if hits else None
+
+
+def start(t):
+    argv = [CLAUDE, '--resume' if transcript(t) else '--session-id', t['session'], '-n', f'sched·{t["id"]}']
+    if t.get('permission_mode'):
+        argv += ['--permission-mode', t['permission_mode']]
+    if t.get('model'):
+        argv += ['--model', t['model']]
+    if t.get('chrome'):
+        argv += ['--chrome']
+    labels = ['--label', f'hc-task={t["id"]}']
+    sid = space_id()
+    if sid:
+        labels += ['--label', f'herdr.space={sid}']
+    hc('run', '--bg', '--name', f'sched-{t["id"]}', '--cwd', t['cwd'], '--no-parent', '--outlive-parent', '--no-notify',
+       *labels, '--', *argv, check=True)
+    named = False
+    for _ in range(60):  # 等 claude 起来并报 idle
+        time.sleep(2)
+        d = terminal(t)
+        if d and not named and (tab := tab_of(d['address'])):  # 页签默认按编号叫，改成任务名
+            subprocess.run([HERDR_APP, 'do', 'tab.rename', json.dumps({'id': tab, 'name': t['id']})], capture_output=True, timeout=20)
+            named = True
+        if d and state(d) == 'idle':
+            return d
+        if not d:
+            break
+    raise RuntimeError('claude did not become idle (trust-folder, login or update dialog?): check with hc-task open ' + t['id'])
+
+
+# ---------- runs ----------
+
+def last_text(path, offset):
+    text = None
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get('type') != 'assistant':
+                continue
+            parts = (d.get('message') or {}).get('content') or []
+            got = '\n'.join(b.get('text', '') for b in parts if isinstance(b, dict) and b.get('type') == 'text').strip()
+            if got:
+                text = got
+    return text
+
+
+def record(tid, run):
+    runs = f'{ROOT}/{tid}/runs'
+    os.makedirs(runs, exist_ok=True)
+    name = run['started'][:19].replace(':', '').replace('T', '-')
+    for path in (f'{runs}/{name}.json', f'{runs}/latest.json'):
+        with open(path, 'w') as f:
+            json.dump(run, f, ensure_ascii=False, indent=2)
+    old = sorted(p for p in glob.glob(f'{runs}/*.json') if not p.endswith('latest.json'))
+    for p in old[:-KEEP_RUNS]:
+        os.remove(p)
+    write_results()
+
+
+def running(tid):
+    """True while a run of the task holds its lock."""
+    try:
+        with open(f'{ROOT}/{tid}/runs/.lock', 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def detach(tid):
+    task(tid)
+    if running(tid):
+        die(f'{tid} is already running')
+    os.makedirs(f'{ROOT}/{tid}/runs', exist_ok=True)
+    log = open(f'{ROOT}/{tid}/runs/launchd.log', 'a')
+    subprocess.Popen([SELF, 'run', tid], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                     env={**os.environ, 'PATH': PATH, 'HC_TASK_HOME': ROOT})
+    print(f'{tid}: started')
+
+
+def run(tid):
+    t = task(tid)
+    os.makedirs(f'{ROOT}/{tid}/runs', exist_ok=True)
+    lock = open(f'{ROOT}/{tid}/runs/.lock', 'w')
+    started = now_iso()
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        record(tid, {'started': started, 'finished': now_iso(), 'status': 'skipped', 'result': 'previous run still going, this slot skipped'})
+        return 0
+    try:
+        d = terminal(t) or start(t)
+        if not d:
+            raise RuntimeError('terminal did not start')
+        waited = 0
+        while state(d) == 'working' and waited < BUSY_LIMIT:  # 你正在里面聊：等这一轮结束
+            time.sleep(15)
+            waited += 15
+            d = terminal(t) or start(t)
+        path = transcript(t)
+        offset = os.path.getsize(path) if path else 0
+        turn = d.get('turn', 0)
+        prompt = open(f'{ROOT}/{tid}/prompt.md').read().strip()
+        text = (f'[定时任务 {tid} · {datetime.now():%Y-%m-%d %H:%M}] 按下面的任务说明执行一次。\n\n{prompt}\n\n'
+                '做完后最后一条消息以「本次结果：」开头，写清做了什么、产出在哪、需要用户处理什么。')
+        hc('send', f'sched-{tid}', text, check=True)
+        status, deadline = 'timeout', time.time() + TURN_LIMIT
+        while time.time() < deadline:
+            time.sleep(10)
+            d = terminal(t)
+            if not d:
+                status = 'error'
+                break
+            if state(d) == 'blocked':
+                status = 'blocked'
+                break
+            if d.get('turn', 0) > turn and state(d) in ('idle', 'done'):
+                status = 'ok'
+                break
+        path = path or transcript(t)
+        result = last_text(path, offset) if path else None
+        if status == 'error':
+            result = (result or '') + '\n(terminal exited during the run)'
+        elif status == 'blocked':
+            result = (result or '') + '\n(waiting for you: hc-task open ' + tid + ')'
+        elif status == 'timeout':
+            result = (result or '') + f'\n(not finished after {TURN_LIMIT // 60} min, still going in the terminal)'
+        record(tid, {'started': started, 'finished': now_iso(), 'status': status, 'result': (result or '').strip()[:8000]})
+        return 0 if status == 'ok' else 1
+    except Exception as e:
+        record(tid, {'started': started, 'finished': now_iso(), 'status': 'error', 'result': f'did not start: {e}'})
+        return 1
+
+
+WORD = {'ok': 'done', 'blocked': 'needs you', 'error': 'error', 'timeout': 'timed out', 'skipped': 'skipped'}
+
+
+def write_results():
+    lines = [f'# Scheduled task results\n\nUpdated {now_iso()}. Latest run of each task; history is in each task\'s runs/, the session opens with `hc-task open <id>`.\n']
+    for t in tasks():
+        r = latest(t['id'])
+        head = f'## {t.get("name") or t["id"]} ({"active" if t.get("enabled") else "paused"} · {t["cron"]})'
+        if not r:
+            lines.append(f'{head}\n\nNot run yet.\n')
+            continue
+        lines.append(f'{head}\n\n{r["started"][:16].replace("T", " ")} · {WORD.get(r["status"], r["status"])}\n\n{r.get("result") or "(no text result)"}\n')
+    with open(f'{ROOT}/RESULTS.md.tmp', 'w') as f:
+        f.write('\n'.join(lines))
+    os.replace(f'{ROOT}/RESULTS.md.tmp', f'{ROOT}/RESULTS.md')
+
+
+# ---------- commands ----------
+
+def cmd_ls():
+    out = []
+    for t in tasks():
+        r = latest(t['id']) or {}
+        out.append({**{k: t.get(k) for k in ('id', 'name', 'cron', 'cwd', 'enabled', 'session')},
+                    'last': r.get('started'), 'status': r.get('status'), 'result': r.get('result'),
+                    'terminal': bool(terminal(t)), 'running': running(t['id'])})
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_results(watch):
+    while True:
+        if not os.path.exists(f'{ROOT}/RESULTS.md'):
+            write_results()
+        text = open(f'{ROOT}/RESULTS.md').read()
+        if not watch:
+            print(text)
+            return
+        print('\033[2J\033[H' + text, flush=True)
+        time.sleep(60)
+
+
+def cmd_open(tid):
+    t = task(tid)
+    d = terminal(t) or start(t)
+    tab = tab_of(d['address']) if d else None
+    if tab:
+        subprocess.run([HERDR_APP, 'do', 'tab.select', json.dumps({'id': tab})], capture_output=True, timeout=20)
+    print(f'sched-{tid}' if d else 'did not start')
+
+
+def cmd_open_results():
+    sid = space_id()
+    try:
+        spaces = json.loads(subprocess.run([HERDR_APP, 'ls'], capture_output=True, text=True, timeout=20).stdout)['spaces']
+    except Exception:
+        die('the herdr window is not open')
+    space = next((s for s in spaces if s['id'] == sid), None) or die(f'no "{SPACE}" space')
+    tab = next((x['id'] for x in space.get('tabs') or [] if x.get('name') in (RESULTS_TAB, '汇总')), None)
+    if tab:
+        subprocess.run([HERDR_APP, 'do', 'tab.select', json.dumps({'id': tab})], capture_output=True, timeout=20)
+    else:
+        req = {'space': sid, 'folder': ROOT, 'name': RESULTS_TAB, 'argv': [SELF, 'results', '--watch']}
+        subprocess.run([HERDR_APP, 'do', 'tab.new', json.dumps(req, ensure_ascii=False)], capture_output=True, timeout=20)
+    print(RESULTS_TAB)
+
+
+def next_runs(cron, count=3):
+    """The next `count` times the cron fires (local time), searched minute by minute over 8 days."""
+    slots = calendar(cron)
+    t = datetime.now().replace(second=0, microsecond=0)
+    out = []
+    for _ in range(8 * 24 * 60):
+        t = datetime.fromtimestamp(t.timestamp() + 60)
+        wd = (t.weekday() + 1) % 7  # launchd: 0 = Sunday
+        if any(e['Minute'] == t.minute and e['Hour'] == t.hour and e.get('Weekday', wd) == wd for e in slots):
+            out.append(t.astimezone().isoformat(timespec='minutes'))
+            if len(out) == count:
+                break
+    return out
+
+
+def cmd_next(cron):
+    try:
+        if len(cron.split()) != 5:
+            raise ValueError('a cron has five fields: minute hour day-of-month month weekday')
+        print(json.dumps({'next': next_runs(cron)}))
+    except ValueError as e:
+        msg = str(e)
+        print(json.dumps({'error': msg if ' ' in msg else f'cannot read {msg!r}'}))
+
+
+def cmd_show(tid):
+    t = task(tid)
+    try:
+        prompt = open(f'{ROOT}/{tid}/prompt.md').read()
+    except FileNotFoundError:
+        prompt = ''
+    print(json.dumps({**t, 'prompt': prompt, 'running': running(tid)}, ensure_ascii=False))
+
+
+def slug(name):
+    base = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')[:40].strip('-') or 'task'
+    tid, n = base, 2
+    while os.path.exists(f'{ROOT}/{tid}'):
+        tid, n = f'{base}-{n}', n + 1
+    return tid
+
+
+MODES = ('auto', 'acceptEdits', 'manual', 'dontAsk', 'plan', 'bypassPermissions')
+RESTART = ('cwd', 'permission_mode', 'model', 'chrome')  # launch options: a live session restarts to pick them up
+
+
+def cmd_save(data):
+    name, prompt, cron = (data.get('name') or '').strip(), (data.get('prompt') or '').strip(), ' '.join((data.get('cron') or '').split())
+    cwd = os.path.expanduser((data.get('cwd') or '').strip() or HOME)
+    if not name:
+        die('name is empty')
+    if not prompt:
+        die('prompt is empty')
+    if not os.path.isdir(cwd):
+        die(f'folder does not exist: {cwd}')
+    try:
+        if len(cron.split()) != 5:
+            raise ValueError('a cron has five fields: minute hour day-of-month month weekday')
+        calendar(cron)
+    except ValueError as e:
+        die(f'schedule: {e}')
+    mode = data.get('permission_mode') or 'auto'
+    if mode not in MODES:
+        die(f'permission mode must be one of {", ".join(MODES)}')
+    fields = {'name': name, 'cron': cron, 'cwd': cwd.rstrip('/') or '/', 'permission_mode': mode,
+              'model': (data.get('model') or '').strip() or None, 'chrome': bool(data.get('chrome')), 'enabled': bool(data.get('enabled'))}
+    tid = data.get('id')
+    if tid:
+        old = task(tid)
+        t = {**old, **fields}
+        if old.get('cwd') != t['cwd']:
+            t['session'] = str(uuid.uuid4())  # a session lives in its folder: a new folder starts a new conversation
+        restart = any(old.get(k) != t.get(k) for k in RESTART)
+    else:
+        tid = slug(name)
+        t = {'id': tid, **fields, 'session': str(uuid.uuid4())}
+        restart = False
+    os.makedirs(f'{ROOT}/{tid}/runs', exist_ok=True)
+    with open(f'{ROOT}/{tid}/prompt.md.tmp', 'w') as f:
+        f.write(prompt + '\n')
+    os.replace(f'{ROOT}/{tid}/prompt.md.tmp', f'{ROOT}/{tid}/prompt.md')
+    save(t)
+    sync_one(t)
+    note = None
+    if restart and (d := terminal(t)):
+        if state(d) in ('idle', 'done') and not running(tid):
+            retire(tid)
+            note = 'session restarts with the new settings on the next run'
+        else:
+            note = 'session is busy: the new settings apply after it is restarted'
+    write_results()
+    print(json.dumps({'id': tid, 'note': note}))
+
+
+def cmd_toggle(tid, on):
+    t = task(tid)
+    t['enabled'] = on
+    save(t)
+    print(f'{tid}: {sync_one(t)}')
+
+
+def cmd_sync():
+    names = {t['id'] for t in tasks()}
+    for path in glob.glob(f'{AGENTS}/{LABEL}*.plist'):
+        tid = os.path.basename(path)[len(LABEL):-len('.plist')]
+        if tid not in names:
+            launchctl('bootout', f'gui/{os.getuid()}/{LABEL}{tid}')
+            os.remove(path)
+            print(f'{tid}: removed')
+    for t in tasks():
+        print(f'{t["id"]}: {sync_one(t)}')
+
+
+def desktop_tasks():
+    root = f'{HOME}/Library/Application Support/Claude'
+    account = json.load(open(f'{root}/config.json')).get('lastKnownAccountUuid')
+    files = [f for f in glob.glob(f'{root}/claude-code-sessions/*/*/scheduled-tasks.json') if f.split('/')[-3] == account]
+    if not files:
+        die('no scheduled-tasks.json for the signed-in Claude Desktop account')
+    path = max(files, key=os.path.getmtime)
+    return path, [k for k in json.load(open(path)).get('scheduledTasks') or [] if k.get('cronExpression')]
+
+
+def cmd_import(apply):
+    path, found = desktop_tasks()
+    print(f'source: {path}')
+    for k in found:
+        tid, dest = k['id'], f'{ROOT}/{k["id"]}'
+        src = k.get('filePath') or f'{HOME}/.claude/scheduled-tasks/{tid}/SKILL.md'
+        prompt = open(src).read()
+        if prompt.startswith('---'):  # 去掉 SKILL.md 的 frontmatter
+            prompt = prompt.split('---', 2)[2].lstrip()
+        t = {'id': tid, 'name': k.get('displayName') or tid, 'cron': k['cronExpression'], 'cwd': k.get('cwd') or HOME,
+             'permission_mode': k.get('permissionMode') or 'auto', 'model': k.get('model'),
+             'chrome': bool(CHROME_HINT.search(prompt)), 'enabled': bool(k.get('enabled')), 'session': str(uuid.uuid4())}
+        calendar(t['cron'])  # 读不懂的 cron 在这里就报错
+        exists = os.path.exists(f'{dest}/task.json')
+        print(f'{"skip (exists)" if exists else "import"} {tid}: {t["cron"]} · {"active" if t["enabled"] else "paused"} · '
+              f'{"Chrome" if t["chrome"] else "no browser"} · {t["cwd"]}')
+        if apply and not exists:
+            os.makedirs(f'{dest}/runs', exist_ok=True)
+            open(f'{dest}/prompt.md', 'w').write(prompt)
+            save(t)
+    if apply:
+        write_results()
+
+
+def cmd_rm(tid):
+    t = task(tid)
+    t['enabled'] = False
+    sync_one(t)
+    retire(tid)  # the session ends with the task; its transcript stays in ~/.claude
+    trash = f'{HOME}/.Trash/hc-task-{tid}-{datetime.now():%Y%m%d-%H%M%S}'
+    shutil.move(f'{ROOT}/{tid}', trash)
+    print(f'{tid}: launchd job removed, folder moved to {trash}')
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help'):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    os.makedirs(ROOT, exist_ok=True)
+    args = [a for a in rest if not a.startswith('--')]
+    need = lambda: args[0] if args else die(f'usage: hc-task {cmd} <id>')
+    if cmd == 'ls':
+        cmd_ls()
+    elif cmd == 'results':
+        cmd_results('--watch' in rest)
+    elif cmd == 'run':
+        return detach(need()) if '--detach' in rest else run(need())
+    elif cmd == 'show':
+        cmd_show(need())
+    elif cmd == 'save':
+        cmd_save(json.loads(rest[rest.index('--json') + 1]) if '--json' in rest else json.load(sys.stdin))
+    elif cmd == 'next':
+        cmd_next(' '.join(rest))
+    elif cmd == 'open':
+        cmd_open(rest[0]) if rest else cmd_open_results()
+    elif cmd in ('on', 'off'):
+        cmd_toggle(need(), cmd == 'on')
+    elif cmd == 'sync':
+        cmd_sync()
+    elif cmd == 'import-desktop':
+        cmd_import('--apply' in rest)
+    elif cmd == 'rm':
+        cmd_rm(need())
+    else:
+        die(f'unknown command: {cmd} (hc-task --help)')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

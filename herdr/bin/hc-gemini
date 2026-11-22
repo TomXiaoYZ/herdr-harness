@@ -1,0 +1,17 @@
+#!/bin/bash
+# Start Gemini CLI as a read-only research helper inside a herdr-core terminal.
+# Auth: when the login Keychain has service "gemini-api-key", that key is exported to this process only;
+# otherwise Gemini uses its own login (Google account, set up once by用户inside gemini).
+# herdr/policies/gemini-readonly.toml denies file edits and lets `hc send` run without a prompt; other shell
+# commands still ask, and the parent session answers them (hc keys <child> enter).
+# Chrome tools come from Gemini's user settings (Claude Code's browser bridge, registered by herdr/install.sh).
+# HC_GEMINI_MODEL picks the model; unset, Gemini's own default applies.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")" && pwd -P)"
+if key=$(security find-generic-password -s gemini-api-key -w 2>/dev/null); then
+  export GEMINI_API_KEY="$key"
+fi
+unset key
+args=(--policy "$here/../policies/gemini-readonly.toml")
+[[ -n "${HC_GEMINI_MODEL:-}" ]] && args+=(-m "$HC_GEMINI_MODEL")
+exec /opt/homebrew/bin/gemini "${args[@]}" "$@"

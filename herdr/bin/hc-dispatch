@@ -1,0 +1,241 @@
+#!/opt/homebrew/bin/python3 -I
+"""Dispatch a helper agent from the current herdr session and hand it the parent's context.
+
+  hc-dispatch <template> --goal <母会话目标> [--facts <已定事实>]... [--file <路径>]... [--done <完成标准>]
+              [--name <终端名>] [--cwd <目录>] [--worktree] [--wait] <任务>
+  hc-dispatch --to <终端名> [--facts ...] [--file ...] [--done ...] <任务>     # 关联任务续派给同一个子 agent
+
+`hc run <template> <task>` alone gives the child only the template text and the task: it inherits the working
+directory and the convention files, but knows nothing about what the parent session is doing. This wrapper
+prepends a "母会话上下文" block: what the parent says (goal, settled facts, files, definition of done) plus what
+can be read off the machine (parent terminal, repository, worktree, branch, HEAD, uncommitted files, and the
+parent's Claude Code transcript path for look-ups). --goal is required so a dispatch never goes out blind.
+Card-based Codex dispatch keeps using herdr_dispatch.py; the card is its context.
+
+Reporting back does not depend on the child: a detached watcher waits for the child's turn to end and types a
+one-line note into the parent terminal (Codex's sandbox cannot reach the hc socket, so its own `hc send` fails).
+Permission prompts are the parent's to answer: a child works under the parent's authority, so
+when it stops on a prompt the watcher tells the parent, which approves what it may do itself (`hc keys <child>
+enter`) and rejects or escalates the rest, and the watcher keeps following the turn.
+--worktree gives the child its own worktree: `<repo>/.worktrees/<name>` on branch `task/<name>`,
+cut from the parent's HEAD by task_worktree.py (the only sanctioned way, with its cap and ledger). Use it when the
+child changes files; read-only helpers share the parent's worktree. The sidebar shows the worktree with its PR and
+CI state under the child. A child may dispatch its own children the same way; the tree can be any depth.
+Children are not removed when a turn ends. They stay under the parent session for follow-ups (--to) and end
+with the parent (hc's default), so a session is archived as a whole.
+"""
+import argparse, json, os, subprocess, sys, time
+
+HC = os.path.expanduser('~/.local/bin/hc')
+
+
+def sh(*argv, cwd=None):
+    try:
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=15).stdout.strip()
+    except Exception:
+        return ''
+
+
+TASK_WORKTREE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+                             'skills', 'delegate-to-codex', 'scripts', 'task_worktree.py')
+
+
+def own_worktree(name, cwd):
+    """Create the child's worktree from the parent's HEAD. Returns (path, branch, base) or exits with the reason."""
+    common = sh('git', 'rev-parse', '--path-format=absolute', '--git-common-dir', cwd=cwd)
+    base = sh('git', 'rev-parse', 'HEAD', cwd=cwd)
+    if not common.endswith('/.git') or not base:
+        sys.exit(f'--worktree 需要在 git 仓库里派发：{cwd}')
+    res = subprocess.run([sys.executable, '-I', TASK_WORKTREE, 'new', '--repo', os.path.dirname(common), '--task', name, '--base', base],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.exit(f'没能建子工作树：{(res.stderr or res.stdout).strip()}')
+    made = json.loads(res.stdout.strip().splitlines()[-1])
+    return made['worktree'], made['branch'], base[:7]
+
+
+def context(a, cwd):
+    lines = ['【母会话上下文】（派出方给的背景；目标、已定事实、完成标准以此为准，缺信息就用 hc send 问母会话，不猜）']
+    lines.append(f'- 目标：{a.goal}')
+    for f in a.facts:
+        lines.append(f'- 已定事实：{f}')
+    for f in a.file:
+        lines.append(f'- 相关文件：{f}')
+    if a.done:
+        lines.append(f'- 完成标准：{a.done}')
+    parent = os.environ.get('HC_TERMINAL_ID')
+    if parent:
+        where = ''
+        try:
+            where = json.loads(sh(HC, 'get', parent, '--json')).get('labels', {}).get('where', '')
+        except Exception:
+            pass
+        lines.append(f'- 母终端：{parent}' + (f'（{where}）' if where else '') + f'。回报：把结果作为本轮最后一条消息输出（本轮结束时母会话会收到通知并来读）；中途卡住要问时用 hc send {parent}')
+    root = sh('git', 'rev-parse', '--show-toplevel', cwd=cwd)
+    if root:
+        common = sh('git', 'rev-parse', '--path-format=absolute', '--git-common-dir', cwd=cwd)
+        main = os.path.dirname(common) if common.endswith('/.git') else ''
+        branch = sh('git', 'branch', '--show-current', cwd=cwd) or '(detached)'
+        lines.append(f'- 工作树：{root}，分支 {branch}，HEAD {sh("git", "rev-parse", "--short", "HEAD", cwd=cwd)}'
+                     + (f'；主检出 {main}' if main and main != root else ''))
+        dirty = sh('git', 'status', '--porcelain', cwd=cwd).splitlines()
+        if a.own:
+            lines[-1] = lines[-1].replace('- 工作树：', '- 母会话的工作树（只读参考）：')
+            lines.append(f'- 你的工作树：{a.own[0]}，分支 {a.own[1]}（从母会话 HEAD {a.own[2]} 分出；母会话未提交的改动不在里面）。'
+                         f'只在这里改；不推送、不合并，提交与开 PR 由母会话决定')
+        if dirty:
+            shown = '、'.join(d.strip() for d in dirty[:12]) + (f' 等 {len(dirty)} 项' if len(dirty) > 12 else '')
+            lines.append(f'- 未提交改动（母会话的在办工作，不要还原或清理）：{shown}')
+    else:
+        lines.append(f'- 工作目录：{cwd}（不是 git 仓库）')
+    sid = os.environ.get('CLAUDE_CODE_SESSION_ID')
+    if sid:
+        log = os.path.expanduser(f'~/.claude/projects/{os.getcwd().replace("/", "-").replace(".", "-")}/{sid}.jsonl')
+        if os.path.exists(log):
+            lines.append(f'- 母会话转录（只读，很大；需要查某个细节时用 grep，不要整读）：{log}')
+    return '\n'.join(lines)
+
+
+def watch(child, parent, turn0=0):
+    """Detached: wait until the child's turn ends, then tell the parent terminal where to read the result.
+
+    The parent goes idle trusting this note, so a wrong "done" strands it: it reads, sees the child still busy,
+    and nothing wakes it again (2026-11-21, a gemini child that never reported status was announced finished at
+    launch). A turn only counts as ended when hc's turn counter has moved past `turn0` (the count before this
+    task was sent) and the status is no longer working; a child that never reports status gets one honest
+    "can't tell" note instead of a guess."""
+    if os.fork():
+        return
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    status = 'unknown'
+    time.sleep(5)  # 让子 agent 先收到任务并开始本轮
+    started = time.time()
+    deadline = started + 6 * 3600
+    while time.time() < deadline:
+        try:
+            status = json.loads(sh_long(HC, 'wait', child, '--json', '--timeout', '900').splitlines()[-1]).get('status', 'unknown')
+        except Exception:
+            status = 'gone'
+        if status == 'gone' or state_of(child) == 'gone':
+            status = 'gone'
+            break
+        if status == 'blocked':  # 批准提示归母会话确认；确认后接着盯到本轮结束
+            subprocess.run([HC, 'send', parent, f'[hc-dispatch] 子 agent {child} 停在批准提示上，由母会话确认：hc read {child} 看它要做什么；'
+                                                f'母会话自己有权做的就批（hc keys {child} enter），否则拒绝（选 Reject）或交给用户'], capture_output=True)
+            while time.time() < deadline and state_of(child) == 'blocked':
+                time.sleep(3)
+            continue
+        if status == 'working':
+            continue
+        info = info_of(child)
+        if info.get('turn', 0) > turn0 and status is not None:
+            break
+        # 还没真正开始这一轮（启动时的 idle、没上报状态的程序）：hc wait 会立刻返回，所以自己等一下再看
+        if not info.get('reported') and time.time() - started > 600:
+            subprocess.run([HC, 'send', parent, f'[hc-dispatch] 子 agent {child} 不向 herdr 上报状态，判断不了它这一轮是否结束；'
+                                                f'不要空等它的通知：hc read {child} 看进度，或改派会上报状态的 agent'], capture_output=True)
+            os._exit(0)
+        time.sleep(10)
+    word = {'done': '本轮完成', 'idle': '本轮结束', 'blocked': '卡住，等人处理', 'gone': '终端已不在', 'working': '6 小时仍在跑，watcher 停止盯'}.get(status, status)
+    subprocess.run([HC, 'send', parent, f'[hc-dispatch] 子 agent {child}：{word}。结果读它的最后一条消息：hc read {child}；'
+                                        f'关联任务续派：hc-dispatch --to {child} <任务>'], capture_output=True)
+    os._exit(0)
+
+
+def wait_out(child, out):
+    """--wait：hc 的等待在“有人给调用方发消息”时也会返回（reason=message），子 agent 中途 hc send 母会话就会
+    让它提前结束。这种情况接着等，直到子 agent 本轮真的停下；超时的例行返回照旧交还调用方。"""
+    while True:
+        print(out, end='', flush=True)
+        try:
+            got = json.loads(out.strip().splitlines()[-1])
+            got = got.get('wait', got)
+        except Exception:
+            return
+        if got.get('reason') != 'message' or got.get('status') != 'working':
+            return
+        out = subprocess.run([HC, 'wait', child, '--json'], capture_output=True, text=True).stdout
+        if not out.strip():
+            return
+
+
+def info_of(child):
+    try:
+        return json.loads(sh(HC, 'get', child, '--json')) or {}
+    except Exception:
+        return {}
+
+
+def state_of(child):
+    info = info_of(child)
+    if not info or info.get('state') not in (None, 'live'):
+        return 'gone'
+    status = info.get('status')
+    return status.get('state') if isinstance(status, dict) else status  # hc get 给的是 {app, state, …}
+
+
+def sh_long(*argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=1000).stdout.strip()
+
+
+def main():
+    p = argparse.ArgumentParser(description='从当前 herdr 会话派发一个带母会话上下文的子 agent')
+    p.add_argument('words', nargs='+', metavar='[template] task')
+    p.add_argument('--to', help='续派：把关联任务发给这个已有的子 agent，不新起')
+    p.add_argument('--goal', help='母会话正在做什么、要达成什么（新派发必填）')
+    p.add_argument('--facts', action='append', default=[], help='已经定下来的事实或决定（可重复）')
+    p.add_argument('--file', action='append', default=[], help='子 agent 需要看的文件（可重复）')
+    p.add_argument('--done', help='这次派发怎样算完成')
+    p.add_argument('--name', help='子 agent 的终端名（新派发必填，续派时用它）')
+    p.add_argument('--cwd', default=os.getcwd())
+    p.add_argument('--worktree', action='store_true', help='给子 agent 单开一个工作树（.worktrees/<name>，分支 task/<name>）；要改文件的派发用')
+    p.add_argument('--wait', action='store_true', help='等它本轮结束再返回（默认后台，结束时通知母终端）')
+    p.add_argument('--print', action='store_true', help='只打印将要发出的任务，不派发')
+    a = p.parse_intermixed_args()
+    parent = os.environ.get('HC_TERMINAL_ID')
+    if a.to:
+        if len(a.words) != 1:
+            sys.exit('续派用法：hc-dispatch --to <终端名> <任务>')
+        extra = [f'- 已定事实：{f}' for f in a.facts] + [f'- 相关文件：{f}' for f in a.file] + ([f'- 完成标准：{a.done}'] if a.done else [])
+        text = '【续派，同一母会话】' + (f'（目标更新：{a.goal}）' if a.goal else '') + ('\n' + '\n'.join(extra) if extra else '') + f'\n{a.words[0]}'
+        if a.print:
+            print(text)
+            return
+        turn0 = info_of(a.to).get('turn', 0)
+        res = subprocess.run([HC, 'send', a.to, text])
+        if res.returncode == 0 and parent and not a.wait:
+            watch(a.to, parent, turn0)
+        if res.returncode == 0 and a.wait:
+            wait_out(a.to, subprocess.run([HC, 'wait', a.to, '--json'], capture_output=True, text=True).stdout)
+        sys.exit(res.returncode)
+    if len(a.words) != 2:
+        sys.exit('用法：hc-dispatch <模板> --goal … --name … <任务>')
+    a.template, a.task = a.words
+    if not (a.goal or '').strip() or not a.task.strip():
+        sys.exit('--goal 和任务都不能为空')
+    if not a.name and not a.print:
+        sys.exit('--name 必填：给子 agent 起个名字，关联任务用 --to <名字> 续派给它')
+    cwd = os.path.realpath(a.cwd)
+    a.own = None
+    if a.worktree:
+        a.own = ('<repo>/.worktrees/' + (a.name or '<name>'), 'task/' + (a.name or '<name>'), 'HEAD') if a.print else own_worktree(a.name, cwd)
+    task = f'{context(a, cwd)}\n\n【本次任务】\n{a.task}'
+    if a.print:
+        print(task)
+        return
+    argv = [HC, 'run', '--json', '--cwd', a.own[0] if a.own else cwd, '--name', a.name]
+    if not a.wait:
+        argv.append('--bg')
+    res = subprocess.run(argv + [a.template, task], stdout=subprocess.PIPE if a.wait else None, text=True)
+    if a.wait:
+        wait_out(a.name, res.stdout)
+    if res.returncode == 0 and parent and not a.wait:
+        watch(a.name, parent)
+    sys.exit(res.returncode)
+
+
+if __name__ == '__main__':
+    main()

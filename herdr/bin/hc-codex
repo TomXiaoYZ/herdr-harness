@@ -1,0 +1,26 @@
+#!/bin/bash
+# Start an interactive Codex implementer inside a herdr-core terminal with the
+# delegate-to-codex defaults: gpt-6-astra/xhigh, workspace-write sandbox without
+# network, no approvals, and every MCP server, plugin, app and hook switched off, except computer use:
+# Codex's own desktop-control server (it only answers Codex processes) stays on so the implementer can
+# drive apps and Chrome. It is skipped when Codex Computer Use is not installed.
+# HC_CODEX_MODEL / HC_CODEX_EFFORT override the model only when a card's 授权 grants it.
+set -euo pipefail
+model="${HC_CODEX_MODEL:-gpt-6-astra}"
+effort="${HC_CODEX_EFFORT:-xhigh}"
+args=(--no-daemon -m "$model" -c "model_reasoning_effort=\"$effort\""
+      -c check_for_update_on_startup=false
+      -s workspace-write -a never --disable plugins --disable apps --disable hooks)
+servers=$(/opt/homebrew/bin/python3 -I -c 'import os,tomllib
+p=os.path.expanduser("~/.codex/config.toml")
+print(" ".join(sorted((tomllib.load(open(p,"rb")).get("mcp_servers") or {}).keys())))')
+cu="$HOME/.codex/computer-use"
+sky="$cu/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+for name in $servers; do
+  [[ "$name" == computer-use && -x "$sky" ]] || args+=(-c "mcp_servers.$name.enabled=false")
+done
+if [[ -x "$sky" ]]; then
+  args+=(-c mcp_servers.computer-use.enabled=true -c "mcp_servers.computer-use.command=\"$sky\""
+         -c 'mcp_servers.computer-use.args=["mcp"]' -c "mcp_servers.computer-use.cwd=\"$cu\"")
+fi
+exec /opt/homebrew/bin/codex "${args[@]}" "$@"

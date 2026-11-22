@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Codex"
+  short_description: "Hand a spec'd implementation task to a visible Codex thread"
+  default_prompt: "Use $delegate-to-codex to write the task card, start the Codex thread in this repository, and accept the result."

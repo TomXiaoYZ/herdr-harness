@@ -1,0 +1,27 @@
+#!/bin/bash
+# Start opencode on DeepSeek as a read-only reviewer inside a herdr-core terminal.
+# The API key is read from the login Keychain (service "deepseek-api") at start and
+# only exported to this process; it is never written to opencode's auth file or disk.
+# Edits are denied. Read-only shell commands (ls/cat/grep, git status/diff/log/show) and `hc send` (reporting back
+# to the parent) run without approval so an unattended review does not stall; every other command still asks.
+# --standalone: opencode 2.x otherwise attaches to its shared background service, which never sees this
+# process's DEEPSEEK_API_KEY and silently falls back to opencode's own free model (2026-11-19).
+set -euo pipefail
+key=$(security find-generic-password -s deepseek-api -w 2>/dev/null) || {
+  echo "deepseek-api is not in the Keychain: first run security add-generic-password -s deepseek-api -a \"\$USER\" -w" >&2
+  exit 1
+}
+export DEEPSEEK_API_KEY="$key"
+unset key
+model="${HC_DEEPSEEK_MODEL:-deepseek/deepseek-v4-pro}"
+export OPENCODE_DISABLE_AUTOUPDATE=1
+# Chrome: Claude Code's browser bridge as an MCP server (tabs, page reading, clicks, typing, screenshots in the
+# user's Chrome). Whole-desktop control is not offered here: Codex's computer-use server refuses non-Codex callers.
+chrome="$HOME/.local/bin/claude"
+has_chrome=false; [[ -x "$chrome" ]] && has_chrome=true
+export OPENCODE_CONFIG_CONTENT="{\"model\":\"$model\",\"permission\":{\"edit\":\"deny\",\"bash\":{\"*\":\"ask\",\"pwd\":\"allow\",\"which *\":\"allow\",\"ls *\":\"allow\",\"cat *\":\"allow\",\"head *\":\"allow\",\"tail *\":\"allow\",\"wc *\":\"allow\",\"grep *\":\"allow\",\"rg *\":\"allow\",\"git status*\":\"allow\",\"git diff*\":\"allow\",\"git log*\":\"allow\",\"git show*\":\"allow\",\"git branch --show-current\":\"allow\",\"git rev-parse *\":\"allow\",\"hc send *\":\"allow\"},\"webfetch\":\"allow\"},\"mcp\":{\"chrome\":{\"type\":\"local\",\"command\":[\"$chrome\",\"--claude-in-chrome-mcp\"],\"enabled\":$has_chrome}}}"
+if [[ "${1:-}" == run ]]; then
+  shift
+  exec /opt/homebrew/bin/opencode run --standalone -m "$model" "$@"
+fi
+exec /opt/homebrew/bin/opencode --standalone "$@"

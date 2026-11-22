@@ -1,0 +1,38 @@
+#!/opt/homebrew/bin/python3 -I
+"""Claude Code status line: keep the account's rate limits where the Herdr sidebar can read them.
+
+Claude Code hands every status-line run a JSON document on stdin; on subscription accounts it carries
+`rate_limits` (five_hour / seven_day / per-model weekly windows: used_percentage, resets_at). That is the only local place the limits
+appear, so this writes them to ~/.herdr/usage/claude.json (one small file, overwritten each time — nothing
+accumulates) and prints the same numbers as the status line.
+"""
+import json
+import os
+import sys
+import time
+
+OUT = os.path.expanduser('~/.herdr/usage/claude.json')
+
+
+def main():
+    try:
+        limits = json.load(sys.stdin).get('rate_limits') or {}
+    except Exception:
+        return
+    if not limits:
+        return
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = f'{OUT}.{os.getpid()}'
+    with open(tmp, 'w') as f:
+        json.dump({'at': int(time.time()), 'rate_limits': limits}, f)
+    os.replace(tmp, OUT)
+    said = []
+    for key, w in limits.items():
+        if isinstance(w, dict) and w.get('used_percentage') is not None:
+            name = {'five_hour': '5h', 'seven_day': 'week'}.get(key) or (key[10:].replace('_', ' ').title() + ' week' if key.startswith('seven_day_') else key)
+            said.append(f'{name} {round(w["used_percentage"])}%')
+    print(' · '.join(said))
+
+
+if __name__ == '__main__':
+    main()

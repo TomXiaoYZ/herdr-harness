@@ -1,0 +1,13 @@
+# hc-gemini: a read-only helper. User-tier rules, above Gemini's defaults.
+[[rule]]
+toolName = ["write_file", "replace"]
+decision = "deny"
+priority = 900
+denyMessage = "gemini-helper 不改文件：结论写在回复里，交给母会话。"
+
+# Report back to the parent session without waiting for an approval.
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = "hc send"
+decision = "allow"
+priority = 800

@@ -1,0 +1,109 @@
+#!/opt/homebrew/bin/python3 -I
+"""Archive a Herdr session: end its sub-agents and give back what they borrowed.
+
+  hc-archive <session terminal> --plan     print what archiving would do, as JSON; changes nothing
+  hc-archive <session terminal>            do it, print the same JSON with what happened
+
+A session is a terminal plus everything dispatched under it, at any depth. Archiving:
+  - closes the open PRs of the sub-agents' worktree branches (with a comment; the remote branch stays, so a
+    closed PR can be reopened). The session's own PR is left alone: it is usually the thing waiting to merge.
+  - ends and removes the sub-agent terminals, deepest first; the session terminal itself is left to the caller
+    (the sidebar closes its tab), so this can run from inside the session.
+  - returns the task worktrees those terminals sat in, the session's own included: clean ones through
+    `task_worktree.py return` (the branch is kept unless it is already merged), dirty ones through
+    `workspace_hygiene.py --snapshot-delete` (changes go to the trash with a manifest first).
+A worktree still used by a terminal outside this session is kept. Main checkouts are never touched.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+HC = os.path.expanduser('~/.local/bin/hc')
+GH = '/opt/homebrew/bin/gh'
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+TASK_WORKTREE = os.path.join(REPO, 'skills/delegate-to-codex/scripts/task_worktree.py')
+HYGIENE = os.path.join(REPO, 'scripts/workspace_hygiene.py')
+
+
+def sh(*argv, cwd=None, timeout=120):
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def worktree_of(cwd):
+    """The linked worktree a directory sits in: {path, repo, branch}; None for a main checkout or no repository."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    r = sh('git', 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-common-dir', '--abbrev-ref', 'HEAD', cwd=cwd)
+    if r.returncode != 0:
+        return None
+    top, common, branch = r.stdout.strip().split('\n')[:3]
+    repo = os.path.dirname(common)
+    return None if os.path.realpath(top) == os.path.realpath(repo) else {'path': os.path.realpath(top), 'repo': repo, 'branch': branch}
+
+
+def plan(session):
+    live = [t for t in json.loads(sh(HC, 'ls', '--json').stdout)['terminals'] if t.get('state') == 'live']
+    root = next((t for t in live if session in (t['address'], t.get('name'))), None)
+    if not root:
+        sys.exit(f'no such session terminal: {session}')
+    kids, depth, frontier = [], {root['address']: 0}, [root['address']]
+    while frontier:
+        at = frontier.pop()
+        for t in live:
+            if t.get('parent') == at and t['address'] not in depth:
+                depth[t['address']] = depth[at] + 1
+                kids.append(t)
+                frontier.append(t['address'])
+    kids.sort(key=lambda t: -depth[t['address']])
+    outside = [os.path.realpath(t['cwd']) for t in live if t['address'] not in depth and t.get('cwd')]
+    trees = {}
+    for t in [root] + kids:
+        w = worktree_of(t.get('cwd'))
+        if not w:
+            continue
+        w = trees.setdefault(w['path'], w)
+        w.setdefault('terminals', []).append(t.get('name') or t['address'])
+        w['own'] = w.get('own', False) or t is root  # 会话自己的工作树：PR 不动
+    for w in trees.values():
+        w['shared'] = any(o == w['path'] or o.startswith(w['path'] + '/') for o in outside)
+        w['dirty'] = bool(sh('git', 'status', '--porcelain', cwd=w['path']).stdout.strip())
+        w['pr'] = None
+        if w['branch'] != 'HEAD':
+            r = sh(GH, 'pr', 'list', '--head', w['branch'], '--state', 'open', '--limit', '1', '--json', 'number,url', cwd=w['path'], timeout=30)
+            found = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else []
+            w['pr'] = found[0] if found else None
+        w['close_pr'] = bool(w['pr']) and not w['own'] and not w['shared']
+    return {'session': root['address'], 'terminals': [{'address': t['address'], 'name': t.get('name')} for t in kids], 'worktrees': list(trees.values())}
+
+
+def archive(p):
+    for w in p['worktrees']:
+        if w['close_pr']:
+            r = sh(GH, 'pr', 'close', str(w['pr']['number']), '--comment', f'母会话归档，随会话关闭（分支 {w["branch"]} 保留，可重新打开）。', cwd=w['path'], timeout=60)
+            w['pr_closed'] = r.returncode == 0
+    for t in p['terminals']:
+        sh(HC, 'kill', t['address'])
+        sh(HC, 'rm', t['address'])
+    for w in p['worktrees']:
+        if w['shared']:
+            w['result'] = 'kept: a terminal outside this session still uses it'
+        elif w['dirty']:
+            r = sh('/usr/bin/python3', HYGIENE, '--no-docker', '--no-size', '--snapshot-delete', w['path'], timeout=600)
+            w['result'] = 'uncommitted changes: snapshot to Trash, then removed' if not os.path.isdir(w['path']) else f'could not remove: {(r.stderr or r.stdout).strip()[-200:]}'
+        else:
+            r = sh('/usr/bin/python3', TASK_WORKTREE, 'return', '--worktree', w['path'], '--by', 'hc-archive', '--note', f'会话 {p["session"]} 归档')
+            if os.path.isdir(w['path']):  # 不在台账里的工作树（比如 Herdr 自己建的）
+                r = sh('git', 'worktree', 'remove', w['path'], cwd=w['repo'])
+            w['result'] = 'returned' if not os.path.isdir(w['path']) else f'could not return: {(r.stderr or r.stdout).strip()[-200:]}'
+    return p
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description='Archive a herdr session: stop its sub-agents, return their worktrees, close sub-agent PRs')
+    ap.add_argument('session')
+    ap.add_argument('--plan', action='store_true', help='only print what would be done, change nothing')
+    a = ap.parse_args()
+    p = plan(a.session)
+    print(json.dumps(p if a.plan else archive(p), ensure_ascii=False))
