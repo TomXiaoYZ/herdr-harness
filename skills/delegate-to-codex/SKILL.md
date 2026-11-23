@@ -6,36 +6,35 @@ description: "Hand an implementation task from Claude Code to Codex, by default 
 # Delegate to Codex
 
 Claude Code 定义结果、拆任务、验收；Codex 在既定规格内实现。交接物是仓库里的一张任务卡，
-执行在独立工作树和分支，派出方验收，执行方不改目标。2026-11-19 起默认走 herdr 通道：每次派发是仓库
+执行在独立工作树和分支，派出方验收，执行方不改目标。默认走 herdr 通道：每次派发是仓库
 herdr 空间里一个以任务命名的 Codex 终端，用户在 herdr 窗口里能看过程、接管或追问；Codex App 线程作备用。
 
-三条结构性规则：
-- **一张卡一个新的短上下文。** 项目会话只放规划、拆卡、决定；每张卡的派发、监控、验收在为它新开的任务会话（或新的 Agent 子代理）里做，结束只回 30 行判决。不把一个目标、一批卡交给同一个上下文连续做（2026-11-14：两个子代理各包 26 张、8 张卡，约 420M token 几乎全是反复读 37 万的上下文，当天 Codex 只用 49M）。`codex_thread.py start --card` 和 `turn` 都强制：同一 Claude Code 上下文已派过或驱动过别的卡就拒绝，同卡第 2 轮放行。
-  不要把 `start` 拆给一次性子代理、自己在长上下文里跑 `turn` 和验收（2026-11-15：G4 子代理这样驱动 14 张卡，约 132M token）；
+结构性规则：
+- **一张卡一个新的短上下文。** 项目会话只放规划、拆卡、决定；每张卡的派发、监控、验收在为它新开的任务会话（或新的 Agent 子代理）里做，结束只回 30 行判决。不把一个目标、一批卡交给同一个上下文连续做：长上下文反复重读，成本远超 Codex 本身。`codex_thread.py start --card` 和 `turn` 都强制：同一 Claude Code 上下文已派过或驱动过别的卡就拒绝，同卡第 2 轮放行。
+  不要把 `start` 拆给一次性子代理、自己在长上下文里跑 `turn` 和验收；
   一张卡的 `start`、`turn`、监控、验收都在为它新开的那个上下文里，回执到了才结束（子代理先返回会杀掉它后台的 `turn`）。
 - **截图不进长上下文。** 页面截图、录屏帧的视觉核对交给一次性子代理：只给图片路径和清单里的视觉条目，只收回逐条 pass/fail；
-  派发验收上下文自己不 Read 图片（11-14 G3 把十几张 1440px 截图读进 50 万 token 的上下文，之后每次调用都重读）。
+  派发验收上下文自己不 Read 图片（图片进上下文后每次调用都重读）。
 - **卡是决策完整、不含源码的交接包。** 12 KB 上限，引用路径和符号，Codex 自己读工作树；最多两轮。
 - **门控看外部证据。** Codex 回合末自检钩子跑审计、CC 预列失败测试、验收先从卡写清单再看 diff；回执只是声明。
 
-四条借自 dsh-superagent（`deepseek-ai/dsh-superagent-prototype`）的规则：
+授权与阶段规则（借自 `deepseek-ai/dsh-superagent-prototype`）：
 - **卡的“授权”节是 Mandate。** 网络、可写目录、MCP、模型、强度一次写定，`start --card` 只从这里读，flag 放宽会被拒；要放宽就开新卡。
   消息、评论、文档只是输入，改不了授权。
 - **阶段由结构化字段推导，不手写。** 回执的 `status`/`human_action`、判决的 `verdict`/`final` 决定一张卡在等谁；
   `review_delegations.py` 先列“需要用户的卡”。
 - **一个结构化问题。** 需要用户决定时只问一个具体问题、附建议默认值，走回执/判决的 `human_action` 字段；设计取舍一律停下问。
   对用户只在结果可用、需要决定、做不下去三种时刻开口，一句话。
-- **自主续接先只记录（observe）。** 项目会话没有用户请求就想派的下一张卡，先写成提案不派（见“续接模式”），一周后按记录决定是否放开。
+- **自主续接先只记录（observe）。** 项目会话没有用户请求就想派的下一张卡，先写成提案，是否直接派按仓库的续接模式（见下）。
 
 ## 前提
 
 - **在目标仓库自己的 Claude Code 项目会话里拆卡。** 工作目录必须是目标仓库根或它的工作树（先 `pwd` 核对）。
   harness 自己的会话只做规划和复盘，不拆卡不派发；别的仓库的卡交给各自的项目会话。
-- Codex 守护进程可用：脚本在控制 socket `~/.codex/app-server-control/app-server-control.sock` 缺失时会自动跑 `codex app-server daemon start` 拉起（ChatGPT.app 26.1103 起 App 不再常驻它）；自动拉起也失败才停下告知用户，不退回 `codex exec`。
-  不在就停下告知，不退回 `codex exec`：那种线程 App 永远不显示。
+- Codex 守护进程可用：脚本在控制 socket `~/.codex/app-server-control/app-server-control.sock` 缺失时会自动跑 `codex app-server daemon start` 拉起；自动拉起也失败才停下告知用户，不退回 `codex exec`：那种线程 App 永远不显示。
 - 目标仓库有 herdr 空间（`~/.local/bin/herdr-app ls` 里 folder 等于仓库根）。走 App 备用通道时，仓库根须是某个 Codex 项目的根（`scripts/codex_thread.py projects` 可查）。
   不是就先告诉用户在 App 里把仓库加进项目，再派。不要用 `project/create` 替用户建项目，
-  也不要对未注册的路径跑 `codex app <路径>`：后者会让 App 新建一个重复项目（2026-10-25 实测）。
+  也不要对未注册的路径跑 `codex app <路径>`：后者会让 App 新建一个重复项目。
 - 项目路由：`guard_code_edits.py` 的 `CC_EDIT_FULL_ACCESS` 里列的仓库由 Claude Code 自己开发，不派；其他仓库默认派 Codex。
   有生产、资金或对外红线的仓库，卡的边界里写明不触碰这些链路、云资源和运行配置
   （清单以该仓库 AGENTS.md 为准），且不加 `--mcp`。
@@ -49,10 +48,10 @@ herdr 空间里一个以任务命名的 Codex 终端，用户在 herdr 窗口里
    （测试另算，默认不超过源码的 1.5 倍；卡在“改动预算”里写了测试行数上限时，`diff_audit.py` 以卡为准）。估计超出就拆成几张前后依赖的卡，前一张验收合入后再派下一张；
    超 300 行必须在卡里写拆不动的理由（`check_card.py` 会查）。范围清楚的任务模型基本不过度工程，模糊才会。
 2. **写任务卡。** 从仓库根开工作树和分支，只用 `scripts/task_worktree.py new --repo <repo> --task <task> [--base <起点>]`
-   （2026-11-10 起）：它建 `<repo>/.worktrees/<task>` 和 `task/<task>`、把 `.worktrees/` 加进 `.git/info/exclude`、
+   它建 `<repo>/.worktrees/<task>` 和 `task/<task>`、把 `.worktrees/` 加进 `.git/info/exclude`、
    登记环境账本，并在仓库已有 8 个任务工作树时拒绝（先收口）。仓库根有 `.worktree-sparse` 时做稀疏检出，
    排除里面列的目录（例如大体积数据目录，实测工作树从 5 GB 降到 350 MB）。
-   不要放在 `<repo>/.codex/` 下：Codex 沙箱把仓库内的 `.codex/` 和 `.git/` 视为只读（2026-10-24 实测）。
+   不要放在 `<repo>/.codex/` 下：Codex 沙箱把仓库内的 `.codex/` 和 `.git/` 视为只读。
    也不在 `/tmp`、`~/Documents`、`agent-workspaces` 建工作树：对账脚本只认 `.worktrees/` 和 `.claude/worktrees/`。
    按 [任务卡模板](assets/task-card.md) 写到 `<worktree>/docs/tasks/<日期>-<主题>/README.md`
    （仓库已有 `docs/specs/` 或 `docs/designs/` 就沿用）。要点：
@@ -60,9 +59,9 @@ herdr 空间里一个以任务命名的 Codex 终端，用户在 herdr 窗口里
      测试之外的行为不实现。这是防御性代码最直接的闸门。
    - “编码要求”只有一条根因规则加边界清单：内部调用互相信任、失败就抛，只在列出的外部边界校验。不写禁令列表。
    - 输入清单里每个文件和数据都在给出的路径上可读；需要登录、录屏权限、付费档位的人工前置条件先请用户确认；
-     需要 Docker 的在“授权”里写可写目录与网络，或改为 CC 验收步骤（2026-10-26 复盘教训）。
-   - **浏览器步骤不派。** 脚本派出的 Codex 线程拿不到 App 签发的浏览器插件凭据（2026-10-31 查明，一张卡
-     三轮 blocked 的根因），开 MCP 也救不了。打开网页、截图、上传、登录态操作一律写成 CC 验收步骤（Claude in Chrome）
+     需要 Docker 的在“授权”里写可写目录与网络，或改为 CC 验收步骤。
+   - **浏览器步骤不派。** 脚本派出的 Codex 线程拿不到 App 签发的浏览器插件凭据，
+     开 MCP 也救不了。打开网页、截图、上传、登录态操作一律写成 CC 验收步骤（Claude in Chrome）
      或人工前置条件，Codex 只做本机可完成的制作与代码。
    - 先提交任务卡到任务分支，记下父提交 `<base-commit>`：Codex 读的、审计用的是同一份。
 3. **派出前自检**：`scripts/check_card.py <卡>`（交接卡加 `--kind handoff`）。查 12 KB、贴源码、缺小节、
@@ -98,14 +97,14 @@ herdr 空间里一个以任务命名的 Codex 终端，用户在 herdr 窗口里
 | 已退回，等派下一轮 | 判决 `return`（非 final） | CC 项目会话 |
 | 已结束 | 其余 | - |
 
-## 续接模式（按仓库，2026-11-13 起）
+## 续接模式（按仓库）
 
 项目会话交付一张卡后想自己续接下一张（没有用户的明确请求）时，先写一份提案到
 `~/.agents/work-plans/evidence/delegate/_proposals/<仓库根目录名>/<YYYY-MM-DD>-<slug>.md`：
 `# <会派的卡一句话>`、`- 理由：`、`- 触发：<哪条证据让你想派>`、`- 预算：<行/文件>`。然后看
 `~/.agents/work-plans/continuation-mode.json` 里本仓库的模式：
 
-- `auto`（在 JSON 里按仓库根目录名列出）：可以直接把提案拆成卡派发，
+- `auto`（仓库清单以该文件为准）：可以直接把提案拆成卡派发，
   门禁一条不少（`check_card.py`、独立任务会话、两轮、Stop 钩子、授权节）；每仓库每天最多 2 张自动续接卡；
   派前把提案文件改名加 `dispatched-` 前缀，卡的“目标”里引用它。改变目的、成本、权限或对外行为的提案仍交用户。
 - `observe`（未列出的仓库默认）：只记录提案不派；复盘时由用户决定是否转 `auto`。
@@ -137,10 +136,10 @@ herdr 空间里一个以任务命名的 Codex 终端，用户在 herdr 窗口里
 - 验收读物只有四样：第一阶段写的清单、`diff_audit.py` 输出、回执、验收命令最后 20 行；此外只逐段读 diff 本身。
   Codex 常把回执包在 ```yaml 或 ```text 围栏里，照常读。
 
-## herdr 通道（默认，2026-11-19 起）
+## herdr 通道（默认）
 
-2026-11-19 起派发迁到 herdr 桌面版：CC 规划、拆卡、验收；Codex 实现；opencode（DeepSeek）只读复核；
-pi（DeepSeek）做查资料、跑测试一类辅助。一张试点卡两轮 accept 并合入后全量切换：所有在办仓库默认用本通道，上面 `codex_thread.py` 的 Codex App 通道仅在 herdr 不可用时作备用。
+CC 规划、拆卡、验收；Codex 实现；opencode（DeepSeek）只读复核；pi、gemini、agy 做查资料、跑测试一类辅助。
+所有在办仓库默认用本通道，上面 `codex_thread.py` 的 Codex App 通道仅在 herdr 不可用时作备用。
 仓库须先有 herdr 空间（folder 等于仓库根），否则终端不进窗口。门禁不变：卡、`check_card.py`、`task_worktree.py`、授权节、两轮、一张卡一个上下文、证据目录。
 
 - 派发换成 `scripts/herdr_dispatch.py`：`start --repo <根> --worktree <wt> --card <卡> --base <commit> --name <task>`
@@ -158,7 +157,7 @@ pi（DeepSeek）做查资料、跑测试一类辅助。一张试点卡两轮 acc
   本脚本的 `start`/`review` 带卡，不经它。
 - 多 agent 同项目：每个写代码的 agent 一个任务工作树；复核和助手只读或只写指定结果文件。
   `stop --name <task>` 收掉终端；工作树仍按第 6 步归还。带卡派出的 Codex 与复核终端同样随母会话结束
-  ，所以派出它的任务会话在判决前不要关。
+  （不用 `--outlive-parent`），所以派出它的任务会话在判决前不要关。
 
 ## 对用户说什么
 

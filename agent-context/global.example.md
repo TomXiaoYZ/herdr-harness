@@ -13,15 +13,17 @@
 
 ## 会话内派发（herdr）
 
-- 每个 herdr 会话的主会话默认是 Claude Code，由它按内容把活派给子 agent（Claude Code / Codex / opencode / pi / Gemini）。
+- 每个 herdr 会话的主 agent 默认是 Claude Code（新建时可选其他 agent），由它按内容把活派给子 agent
+  （模板：codex-impl、opencode-review、pi-helper、gemini-helper、agy-helper）。
 - 一律用 `hc-dispatch <模板> --goal … <任务>`，不直接 `hc run`：它把母会话的目标、已定事实、完成标准、
   工作树与未提交改动带给子 agent，并在子 agent 回合真正结束时通知母会话。
-- 关联性强的任务用 `hc-dispatch --to <子 agent>` 续派给同一个子 agent；要改文件的加 `--worktree` 单开子工作树，
+- 并行只给实质独立、边界清楚的任务；关联性强的任务用 `hc-dispatch --to <子 agent>` 续派给同一个子 agent；要改文件的加 `--worktree` 单开子工作树，
   提交与开 PR 由母会话决定。
 - 子 agent 的批准提示由母会话判断并确认（`hc keys <子 agent> enter`）；母会话自己也需人批准的动作不因经子 agent 而放行。
 - 不空等：母会话以“等结果”结束本轮前，确认有东西会叫醒它（`hc-dispatch` 的回报、仍在跑的子代理或后台任务）；
   子代理交回的是“还在等”而不是结果时，当场 `hc read` 核实。
 - 子 agent 回合结束不清理，母会话归档时一并归档（侧栏归档按钮或 `hc-archive <会话>`）。
+- 项目记忆每项目一份，即 Claude Code 按仓库记的那份；其他 agent 开工先跑 `hc-memory`，照其格式写回。
 
 ## 环境是借的
 

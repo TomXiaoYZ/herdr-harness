@@ -54,6 +54,8 @@ copy "$src/mods/projects/mod.json" "$app/mods/projects/mod.json" always
 copy "$src/mods/projects/projects.json" "$app/mods/projects/projects.json" seed
 copy "$src/mods/sched-task/main.js" "$app/mods/sched-task/main.js" always
 copy "$src/mods/sched-task/mod.json" "$app/mods/sched-task/mod.json" always
+copy "$src/mods/new-session/main.js" "$app/mods/new-session/main.js" always
+copy "$src/mods/new-session/mod.json" "$app/mods/new-session/mod.json" always
 copy "$src/layouts/projects.json" "$app/layouts/projects.json" seed
 # Claude Code 的额度靠状态栏脚本落盘；settings.json 归 用户，这里只提示，不改也不算失败。
 settings="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"

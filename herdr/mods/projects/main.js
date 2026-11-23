@@ -1,7 +1,7 @@
 // 项目侧栏：项目 → 会话 → 子 agent。
 // 项目清单在同目录 projects.json；一个项目可以绑定多个文件夹（git 仓库），其中一个是主项目
 // （`main`，不写就是第一个），新会话开在主项目里。文件夹和它的 worktree 里跑着的每个主会话
-// （默认 Claude Code）是一行，下面是它派出去的子 agent（Claude Code / Codex / opencode / pi / Gemini）
+// （Claude Code / Codex / OpenCode / Pi / AGY，“+” 时选）是一行，下面是它派出去的子 agent（Claude Code / Codex / opencode / pi / Gemini / AGY）
 // 和各自在做什么。每行右侧的小点是状态：转圈＝运行中，blocked 色＝等你，
 // done 色＝已完成，空心＝空闲；回合已结束、只剩后台 shell 在跑的算已完成，点左边标“后台 N”。
 // 不属于任何项目的会话归到“其他”。
@@ -606,11 +606,9 @@ export default class Projects extends View {
     });
   }
 
-  // 在这个文件夹里开一个新会话：默认 Claude Code。
+  // 在这个文件夹里开一个新会话：弹出 new-session 选中控 agent（Claude Code / Codex / OpenCode / Pi / AGY）。
   newSession(folder) {
-    const s = folder.spaces[0];
-    if (s) run("tab.new", { space: s.id, folder: folder.path, argv: ["claude"] });
-    else run("space.new", { name: base(folder.path), folder: folder.path, argv: ["claude"] });
+    openOverlay({ mod: "new-session", kind: "popup", width: 220, height: 200, props: { folder: folder.path, space: folder.spaces[0]?.id } });
   }
 
   // 项目行：名字后面跟折叠箭头，最右是“＋”（在主项目里开一个新会话）。
@@ -626,7 +624,7 @@ export default class Projects extends View {
       .child(div().flex_1())
       .when(folded && Boolean(live), (el) => el.child(this.dot(live, t)))
       .when(Boolean(plus), (el) => el.child(div().id(`project-${key}-plus`).size(24).flex_none().flex().items_center().justify_center().rounded(6)
-        .hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("New session (Claude Code)")
+        .hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("New session: pick the agent")
         .on_click((_e, cx) => { cx.stop_propagation(); plus(cx); })
         .child(svg(ICON("plus")).size(13))));
   }
