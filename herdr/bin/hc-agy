@@ -1,0 +1,9 @@
+#!/bin/bash
+# Start Antigravity CLI (agy) inside a herdr-core terminal, billed to the Google Cloud project behind
+# Application Default Credentials (gcloud auth application-default login; the ADC quota project is the one billed).
+# AGY_ADC_AUTH is set here too, so a terminal that did not read ~/.zshrc still signs in the same way.
+# HC_AGY_MODEL picks the model; default Gemini 4 Neon (Medium). Other flags pass through,
+# e.g. `hc-agy --mode plan`. As a sub-agent its role comes from herdr/templates/agy-helper.md.
+set -euo pipefail
+export AGY_ADC_AUTH=true
+exec /opt/homebrew/bin/agy --model "${HC_AGY_MODEL:-gemini-4-neon-medium}" "$@"

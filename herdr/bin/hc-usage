@@ -8,6 +8,8 @@ Everything is read from what the tools already keep on this machine, plus one ba
   Codex         limits and tokens from today's rollout logs (~/.codex/sessions)
   DeepSeek      (opencode and pi) balance from the provider with the Keychain key; today's cost from pi's
                 session logs and `opencode stats`
+  AGY           (Antigravity, billed to a GCP project through ADC) today's and this month's tokens from Cloud
+                Monitoring when HC_AGY_PROJECT is set, against HC_AGY_DAY_TOKENS / HC_AGY_MONTH_TOKENS
 Tokens are fresh input + output (cache reads left out). A source that cannot be read is simply missing from
 the output; the key is never printed.
 """
@@ -15,8 +17,10 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 
 HOME = os.path.expanduser('~')
@@ -153,5 +157,57 @@ def deepseek():
     return out
 
 
+# AGY 走 GCP 项目计费（ADC）。项目里可能还有别的应用在调 Gemini，只把 agy 默认的 Gemini 4 系列算作 agy；
+# 日 / 月上限建议与项目的 GCP 告警策略用同一组数字。不设 HC_AGY_PROJECT 就不查。
+AGY_PROJECT = os.environ.get('HC_AGY_PROJECT', '')
+AGY_MODELS = re.compile(r'^(gemini-4|gemini-pro-orchestrator)')
+AGY_DAY = int(os.environ.get('HC_AGY_DAY_TOKENS', 4_000_000))
+AGY_MONTH = int(os.environ.get('HC_AGY_MONTH_TOKENS', 120_000_000))
+
+
+def agy():
+    out = {'agent': 'AGY', 'quota': [], 'note': f'GCP {AGY_PROJECT} · Gemini 4 models only'}
+    gcloud = shutil.which('gcloud') or '/opt/homebrew/share/google-cloud-sdk/bin/gcloud'
+    if not AGY_PROJECT:
+        return None
+    try:
+        token = subprocess.run([gcloud, 'auth', 'application-default', 'print-access-token'],
+                               capture_output=True, text=True, timeout=20).stdout.strip()
+        if not token:
+            return out
+        now = time.time()
+        month = time.mktime(time.strptime(DAY[:8] + '01', '%Y-%m-%d'))
+        iso = lambda t: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+
+        def spent(start):
+            q = urllib.parse.urlencode({
+                'filter': 'metric.type="aiplatform.googleapis.com/publisher/online_serving/token_count"',
+                'interval.startTime': iso(start), 'interval.endTime': iso(now),
+                'aggregation.alignmentPeriod': f'{max(60, int(now - start))}s',
+                'aggregation.perSeriesAligner': 'ALIGN_SUM'})
+            req = urllib.request.Request(f'https://monitoring.googleapis.com/v3/projects/{AGY_PROJECT}/timeSeries?{q}',
+                                         headers={'Authorization': f'Bearer {token}'})
+            mine = total = 0
+            for s in json.load(urllib.request.urlopen(req, timeout=20)).get('timeSeries', []):
+                n = sum(int(p['value'].get('int64Value', 0)) for p in s.get('points', []))
+                total += n
+                if AGY_MODELS.match(s['resource']['labels'].get('model_user_id', '')):
+                    mine += n
+            return mine, total
+
+        today_mine, today_all = spent(MIDNIGHT)
+        month_mine, _ = spent(month)
+        next_day = MIDNIGHT + 86400
+        y, m = int(DAY[:4]), int(DAY[5:7])
+        next_month = time.mktime(time.strptime(f'{y + m // 12}-{m % 12 + 1:02d}-01', '%Y-%m-%d'))
+        out['quota'] = [{'name': 'day', 'used': min(100, round(100 * today_mine / AGY_DAY)), 'resets': int(next_day)},
+                        {'name': 'month', 'used': min(100, round(100 * month_mine / AGY_MONTH)), 'resets': int(next_month)}]
+        out['today'] = {'tokens': today_mine}
+        out['note'] += f'\nWhole project today: {today_all:,} tokens'
+    except Exception:
+        pass
+    return out
+
+
 if __name__ == '__main__':
-    print(json.dumps([claude(), codex(), deepseek()], ensure_ascii=False))
+    print(json.dumps([x for x in (claude(), codex(), deepseek(), agy()) if x], ensure_ascii=False))

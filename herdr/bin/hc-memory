@@ -1,0 +1,62 @@
+#!/opt/homebrew/bin/python3 -I
+"""The project's shared memory, the same one Claude Code keeps, so every agent (Codex, opencode, pi, AGY, Gemini)
+works from it.
+
+  hc-memory [show] [<dir>]   print where it is, then MEMORY.md and every memory file it holds
+  hc-memory path [<dir>]     print only the directory
+
+<dir> defaults to the current directory. A worktree maps to its main checkout, as Claude Code does, so a task
+worktree and the repository share one memory. The directory is ~/.claude/projects/<path with every character
+that is not a letter or digit turned into "-">/memory. Writing follows the format printed by `show`.
+"""
+import os
+import re
+import subprocess
+import sys
+
+FORMAT = """写法：一个文件一条事实，文件名用短横线 slug，开头 frontmatter：
+---
+name: <slug>
+description: <一行摘要，决定以后是否想起它>
+metadata:
+  type: user | feedback | project | reference
+---
+正文；feedback/project 后加 **Why:** 与 **How to apply:** 两行。写完在 MEMORY.md 加一行 `- [标题](文件名.md) — 一句钩子`。
+先看有没有已覆盖它的文件，有就改那个；错了的删掉。不记代码、git 历史和仓库文档里已有的东西。"""
+
+
+def root(start):
+    """Main checkout of the repository holding start (worktrees included), else start itself."""
+    git = lambda *a: subprocess.run(['git', '-C', start, *a], capture_output=True, text=True).stdout.strip()
+    common = git('rev-parse', '--path-format=absolute', '--git-common-dir')
+    if common:
+        return os.path.dirname(common) if os.path.basename(common) == '.git' else git('rev-parse', '--show-toplevel')
+    return start
+
+
+def where(start):
+    return os.path.join(os.path.expanduser('~/.claude/projects'), re.sub(r'[^A-Za-z0-9]', '-', root(start)), 'memory')
+
+
+def main(argv):
+    cmd = argv[0] if argv and argv[0] in ('show', 'path') else 'show'
+    rest = argv[1:] if argv and argv[0] in ('show', 'path') else argv
+    d = where(os.path.realpath(rest[0] if rest else os.getcwd()))
+    if cmd == 'path':
+        print(d)
+        return 0
+    print(f'项目记忆：{d}')
+    index = os.path.join(d, 'MEMORY.md')
+    if not os.path.isfile(index):
+        print('（还没有记忆）\n\n' + FORMAT)
+        return 0
+    print('\n== MEMORY.md ==\n' + open(index).read().rstrip())
+    for name in sorted(os.listdir(d)):
+        if name.endswith('.md') and name != 'MEMORY.md':
+            print(f'\n== {name} ==\n' + open(os.path.join(d, name)).read().rstrip())
+    print('\n' + FORMAT)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
